@@ -1,4 +1,4 @@
-/* Split virtqueue for the single 9P request queue.
+/* Generic split virtqueue and IRQ core.
 
    The vring lives in one physically contiguous, page-granular region: the
    legacy QUEUE_PFN register addresses the whole vring by physical page
@@ -8,7 +8,7 @@
    into the descriptors and into QUEUE_PFN.
 
    The ring mutex discipline lives here: it is held only while the
-   descriptors, avail index and used ring are touched.  The submit-to-reply
+   descriptors, avail index and used ring are touched.  The submit-to-ack
    wait blocks on a condvar signalled by the irqhelp handler thread, so no
    lock is held across it.  */
 
@@ -22,41 +22,29 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "virtio-9p.h"
-
-#define V9P_VRING_ALIGN 4096
-
-static struct v9p_vring q;
-static uint8_t *tx_buf;
-static uint8_t *rx_buf;
-static uint64_t tx_phys;
-static uint64_t rx_phys;
-uint64_t v9p_vring_phys;
-
-static pthread_mutex_t v9p_irq_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t v9p_irq_cond = PTHREAD_COND_INITIALIZER;
-static struct irq *v9p_irq;
+#include "virtio-queue.h"
 
 static inline void
-v9p_wmb (void)
+virtio_wmb (void)
 {
   __sync_synchronize ();
 }
 
 static inline uint16_t
-v9p_idx_acquire (volatile uint16_t *p)
+virtio_idx_acquire (volatile uint16_t *p)
 {
   uint16_t v = *p;
-  v9p_wmb ();
+  virtio_wmb ();
   return v;
 }
 
-static error_t
-v9p_dma_alloc (size_t size, void **vaddr, uint64_t *paddr)
+error_t
+virtio_dma_alloc (struct virtio_pci_dev *v, size_t size, void **vaddr,
+                  uint64_t *paddr)
 {
   mach_port_t master_host, device_master;
-  vm_address_t v;
-  rpc_phys_addr_t p;
+  vm_address_t addr;
+  rpc_phys_addr_t phys;
   kern_return_t kr;
 
   kr = get_privileged_ports (&master_host, &device_master);
@@ -66,206 +54,283 @@ v9p_dma_alloc (size_t size, void **vaddr, uint64_t *paddr)
 
   /* pmin must be 0; palign 0 selects PAGE_SIZE; pmax 4 GiB selects the
      DMA32 pool, so the returned physical address is the machine address
-     the device DMAes to.  Failure is fatal: undersized buffers would
-     truncate PDUs the unmodified 9pfs client legitimately sends.  */
-  kr = vm_allocate_contiguous (master_host, mach_task_self (), &v, &p,
+     the device DMAes to.  Failure is fatal: a buffer the device cannot
+     reach silently truncates whatever the driver posts.  */
+  kr = vm_allocate_contiguous (master_host, mach_task_self (), &addr, &phys,
                                size, 0, 0x100000000ULL, 0);
   if (kr != KERN_SUCCESS)
     {
-      fprintf (stderr, "virtio-9p: vm_allocate_contiguous (%zu) = %d\n",
-               size, kr);
+      fprintf (stderr, "%s: vm_allocate_contiguous (%zu) = %d\n",
+               v->name, size, kr);
       return ENOMEM;
     }
-  *vaddr = (void *) v;
-  *paddr = p;
+  *vaddr = (void *) addr;
+  *paddr = phys;
   return 0;
 }
 
 error_t
-v9p_queue_setup (void)
+virtio_queue_setup (struct virtio_pci_dev *v, struct virtio_queue *q,
+                    uint16_t index)
 {
   uint16_t num;
   size_t desc_size, avail_off, used_off, region_size;
   void *region;
   uint64_t region_phys;
   error_t err;
+  unsigned i;
 
-  v9p_outw (V9P_PCI_QUEUE_SEL, 0);
-  num = v9p_inw (V9P_PCI_QUEUE_NUM);
-  if (num == 0 || num > V9P_QUEUE_MAX || (num & (num - 1)) != 0)
+  q->pci = v;
+  q->index = index;
+  virtio_pci_outw (v, VIRTIO_PCI_QUEUE_SEL, index);
+  num = virtio_pci_read_queue_num (v);
+  if (num == 0 || num > VIRTIO_QUEUE_MAX || (num & (num - 1)) != 0)
     {
-      fprintf (stderr, "virtio-9p: implausible queue size %u\n", num);
+      fprintf (stderr, "%s: implausible queue size %u\n", v->name, num);
       return EIO;
     }
 
-  desc_size = num * sizeof (struct v9p_desc);
+  desc_size = num * sizeof (struct virtio_desc);
   avail_off = desc_size;
   /* avail: flags, idx, ring[num], used_event; used ring is 4-byte aligned
      per the virtio ring layout (vring_init).  */
-  used_off = (avail_off + 4 + 2 * num + 2 + V9P_VRING_ALIGN - 1)
-             & ~(V9P_VRING_ALIGN - 1);
+  used_off = (avail_off + 4 + 2 * num + 2 + VIRTIO_QUEUE_ALIGN - 1)
+             & ~(VIRTIO_QUEUE_ALIGN - 1);
   region_size = used_off + 4 + 2 * num + (size_t) num * 8 + 2;
 
-  err = v9p_dma_alloc (region_size, &region, &region_phys);
+  err = virtio_dma_alloc (v, region_size, &region, &region_phys);
   if (err)
     return err;
   memset (region, 0, region_size);
 
-  q.num = num;
-  q.desc = region;
-  q.avail_idx = (volatile uint16_t *) ((char *) region + avail_off + 2);
-  q.avail_ring = (uint16_t *) ((char *) region + avail_off + 4);
-  q.used_idx = (volatile uint16_t *) ((char *) region + used_off + 2);
-  q.used_ring = (struct v9p_used_elem *) ((char *) region + used_off + 4);
-  q.last_used = 0;
+  q->num = num;
+  q->desc = region;
+  q->avail_idx = (volatile uint16_t *) ((char *) region + avail_off + 2);
+  q->avail_ring = (uint16_t *) ((char *) region + avail_off + 4);
+  q->used_idx = (volatile uint16_t *) ((char *) region + used_off + 2);
+  q->used_ring = (struct virtio_used_elem *) ((char *) region + used_off + 4);
+  q->last_used = 0;
+  q->region_phys = region_phys;
 
-  err = v9p_dma_alloc (V9P_TX_BUF_SIZE, (void **) &tx_buf, &tx_phys);
-  if (err)
-    return err;
-  err = v9p_dma_alloc (V9P_RX_BUF_SIZE, (void **) &rx_buf, &rx_phys);
-  if (err)
-    return err;
+  pthread_mutex_init (&q->lock, NULL);
+  pthread_cond_init (&q->cv, NULL);
 
-  v9p_outl (V9P_PCI_QUEUE_PFN, region_phys >> 12);
-  v9p_vring_phys = region_phys;
-  if (v9p_inl (V9P_PCI_QUEUE_PFN) != region_phys >> 12)
+  /* All descriptors start on the free list, linked through the same next
+     field the chains use once allocated.  */
+  q->free_head = 0;
+  for (i = 0; i + 1 < num; i++)
+    q->desc[i].next = i + 1;
+  q->desc[num - 1].next = VIRTIO_QUEUE_NO_DESC;
+
+  virtio_pci_outl (v, VIRTIO_PCI_QUEUE_PFN, region_phys >> 12);
+  if (virtio_pci_inl (v, VIRTIO_PCI_QUEUE_PFN) != region_phys >> 12)
     {
-      fprintf (stderr, "virtio-9p: QUEUE_PFN readback mismatch "
+      fprintf (stderr, "%s: queue %u: QUEUE_PFN readback mismatch "
               "(wrote 0x%llx, read 0x%llx)\n",
-              (unsigned long long) (region_phys >> 12),
-              (unsigned long long) v9p_inl (V9P_PCI_QUEUE_PFN));
+              v->name, index, (unsigned long long) (region_phys >> 12),
+              (unsigned long long) virtio_pci_read_queue_pfn (v));
       return EIO;
     }
-  fprintf (stderr, "virtio-9p: queue 0: %u entries, region 0x%llx+%zu "
-           "(phys 0x%llx), TX/RX 0x%llx/0x%llx\n",
-           num, (unsigned long long) (uintptr_t) region, region_size,
-           (unsigned long long) region_phys,
-           (unsigned long long) tx_phys, (unsigned long long) rx_phys);
+  fprintf (stderr, "%s: queue %u: %u entries, region 0x%llx+%zu "
+           "(phys 0x%llx)\n", v->name, index, num,
+           (unsigned long long) (uintptr_t) region, region_size,
+           (unsigned long long) region_phys);
   return 0;
 }
 
-/* One request: the complete outbound PDU in TX, reply capacity in RX.  The
-   reply lands in REPLY (up to REPLY_CAP bytes) and its length in REPLY_LEN.
-   Submits the request, then blocks on the interrupt; the timeout is the
-   fallback for a lost interrupt, not the normal path.  */
-error_t
-v9p_exchange (const void *pdu, uint32_t pdu_len,
-              void *reply, uint32_t reply_cap, uint32_t *reply_len)
+static uint16_t
+virtio_queue_desc_alloc (struct virtio_queue *q)
 {
-  uint32_t used_len;
+  uint16_t idx = q->free_head;
+  if (idx != VIRTIO_QUEUE_NO_DESC)
+    q->free_head = q->desc[idx].next;
+  return idx;
+}
 
-  if (pdu_len < 7 || pdu_len > V9P_TX_BUF_SIZE)
-    return EMSGSIZE;
-  if (reply_cap > V9P_RX_BUF_SIZE)
-    return EMSGSIZE;
+static void
+virtio_queue_desc_free (struct virtio_queue *q, uint16_t idx)
+{
+  q->desc[idx].next = q->free_head;
+  q->free_head = idx;
+}
 
-  memcpy (tx_buf, pdu, pdu_len);
-
-  q.desc[0].addr = tx_phys;
-  q.desc[0].len = pdu_len;
-  /* F_NEXT is what links the TX descriptor to the RX one; without it the
-     device sees a one-descriptor chain and no reply buffer at all.  */
-  q.desc[0].flags = V9P_DESC_F_NEXT;
-  q.desc[0].next = 1;
-  q.desc[1].addr = rx_phys;
-  q.desc[1].len = reply_cap;
-  q.desc[1].flags = V9P_DESC_F_WRITE;
-  q.desc[1].next = 0;
-  v9p_wmb ();
-  q.avail_ring[*q.avail_idx % q.num] = 0;
-  v9p_wmb ();
-  (*q.avail_idx)++;
-  v9p_wmb ();
-  v9p_outw (V9P_PCI_QUEUE_NOTIFY, 0);
-
-  {
-    struct timespec deadline;
-    int werr;
-
-    clock_gettime (CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += V9P_EXCHANGE_TIMEOUT;
-
-    pthread_mutex_lock (&v9p_irq_lock);
-    /* The used index is the condition itself, not a flag: config-change
-       interrupts and leftover signals produce wakeups with nothing new
-       in the ring, which simply loop back to waiting.  */
-    while (v9p_idx_acquire (q.used_idx) == q.last_used)
-      {
-        werr = pthread_cond_timedwait (&v9p_irq_cond, &v9p_irq_lock,
-                                       &deadline);
-        if (werr != 0)
-          {
-            pthread_mutex_unlock (&v9p_irq_lock);
-            fprintf (stderr, "virtio-9p: device did not reply\n");
-            return ETIMEDOUT;
-          }
-      }
-    pthread_mutex_unlock (&v9p_irq_lock);
-  }
-
-  {
-    uint32_t id = q.used_ring[q.last_used % q.num].id;
-    used_len = q.used_ring[q.last_used % q.num].len;
-    if (id >= q.num)
-      {
-        fprintf (stderr, "virtio-9p: used entry id %u out of range\n", id);
-        return EIO;
-      }
-  }
-  if (used_len > reply_cap)
+/* Return the descriptors of a completed chain to the free list.  */
+static void
+virtio_queue_free_chain (struct virtio_queue *q, uint16_t head)
+{
+  uint16_t idx = head;
+  do
     {
-      fprintf (stderr, "virtio-9p: reply %u > capacity %u\n",
-               used_len, reply_cap);
-      return EMSGSIZE;
+      uint16_t next = (q->desc[idx].flags & VIRTQ_DESC_F_NEXT)
+                      ? q->desc[idx].next : VIRTIO_QUEUE_NO_DESC;
+      virtio_queue_desc_free (q, idx);
+      idx = next;
     }
-  memcpy (reply, rx_buf, used_len);
-  *reply_len = used_len;
-  q.last_used++;
+  while (idx != VIRTIO_QUEUE_NO_DESC);
+}
+
+error_t
+virtio_queue_post (struct virtio_queue *q, const struct virtio_buf *bufs,
+                   uint16_t nbufs)
+{
+  uint16_t head, prev, i;
+
+  if (nbufs == 0 || nbufs > q->num)
+    return EMSGSIZE;
+
+  pthread_mutex_lock (&q->lock);
+  head = VIRTIO_QUEUE_NO_DESC;
+  prev = VIRTIO_QUEUE_NO_DESC;
+  for (i = 0; i < nbufs; i++)
+    {
+      uint16_t idx = virtio_queue_desc_alloc (q);
+
+      if (idx == VIRTIO_QUEUE_NO_DESC)
+        {
+          if (head != VIRTIO_QUEUE_NO_DESC)
+            virtio_queue_free_chain (q, head);
+          pthread_mutex_unlock (&q->lock);
+          return EAGAIN;
+        }
+      if (head == VIRTIO_QUEUE_NO_DESC)
+        head = idx;
+      else
+        {
+          q->desc[prev].flags |= VIRTQ_DESC_F_NEXT;
+          q->desc[prev].next = idx;
+        }
+      /* The core owns F_NEXT: a caller-supplied NEXT on the last buffer
+         would make the device chase descriptor 0.  */
+      q->desc[idx].addr = bufs[i].addr;
+      q->desc[idx].len = bufs[i].len;
+      q->desc[idx].flags = bufs[i].flags & ~VIRTQ_DESC_F_NEXT;
+      q->desc[idx].next = 0;
+      prev = idx;
+    }
+
+  /* F_NEXT is what links the descriptors of a chain; the last one has it
+     clear, and only device-writable buffers carry F_WRITE.  */
+  virtio_wmb ();
+  q->avail_ring[(*q->avail_idx) % q->num] = head;
+  virtio_wmb ();
+  (*q->avail_idx)++;
+  virtio_wmb ();
+  virtio_pci_outw (q->pci, VIRTIO_PCI_QUEUE_NOTIFY, q->index);
+  pthread_mutex_unlock (&q->lock);
+  return 0;
+}
+
+error_t
+virtio_queue_wait_used (struct virtio_queue *q, int timeout_sec,
+                        struct virtio_used_elem *elem)
+{
+  struct timespec deadline;
+  int werr;
+
+  clock_gettime (CLOCK_REALTIME, &deadline);
+  deadline.tv_sec += timeout_sec;
+
+  pthread_mutex_lock (&q->lock);
+  /* The used index is the condition itself, not a flag: config-change
+     interrupts and leftover signals produce wakeups with nothing new in
+     the ring, which simply loop back to waiting.  */
+  while (virtio_idx_acquire (q->used_idx) == q->last_used)
+    {
+      werr = pthread_cond_timedwait (&q->cv, &q->lock, &deadline);
+      if (werr != 0)
+        {
+          pthread_mutex_unlock (&q->lock);
+          fprintf (stderr, "%s: queue %u: device did not reply\n",
+                   q->pci->name, q->index);
+          return ETIMEDOUT;
+        }
+    }
+
+  *elem = q->used_ring[q->last_used % q->num];
+  if (elem->id >= q->num)
+    {
+      pthread_mutex_unlock (&q->lock);
+      fprintf (stderr, "%s: queue %u: used entry id %u out of range\n",
+               q->pci->name, q->index, elem->id);
+      return EIO;
+    }
+  virtio_queue_free_chain (q, elem->id);
+  q->last_used++;
+  pthread_mutex_unlock (&q->lock);
   return 0;
 }
 
 /* Runs on irqhelp's own thread.  The ISR read is the device-level ack and
    the ownership check in one: zero means another device on this shared
-   line asserted it and nothing must be touched.  Bit 0 is set for queue
-   completions and config changes alike (QEMU writes 0x3 for the latter),
-   so the waiter re-checks the used index instead of trusting the signal.
-   irqhelp calls device_intr_ack after this returns; that kernel-level
-   unmask is why the handler, not the exchange, must read the ISR.  */
+   line asserted it and nothing must be touched.  Queue completions set bit
+   0, config changes bit 1 (QEMU writes 0x3 for the latter), so the single
+   read dispatches both causes before irqhelp performs the kernel-level
+   ack/unmask.  */
 static void
-v9p_irq_handler (void *ctx)
+virtio_irq_handler (void *ctx)
 {
-  if (!(v9p_read_isr () & 1))
+  struct virtio_irq *irq = ctx;
+  size_t k;
+  uint8_t isr = virtio_pci_read_isr (irq->pci);
+
+  if (!(isr & (VIRTIO_PCI_ISR_USED | VIRTIO_PCI_ISR_CONFIG)))
     return;
-  pthread_mutex_lock (&v9p_irq_lock);
-  pthread_cond_broadcast (&v9p_irq_cond);
-  pthread_mutex_unlock (&v9p_irq_lock);
+
+  for (k = 0; k < irq->nqueues; k++)
+    {
+      struct virtio_queue *q = irq->queues[k];
+      pthread_mutex_lock (&q->lock);
+      pthread_cond_broadcast (&q->cv);
+      pthread_mutex_unlock (&q->lock);
+    }
+
+  if (isr & VIRTIO_PCI_ISR_CONFIG)
+    {
+      pthread_mutex_lock (&irq->lock);
+      irq->config_seq++;
+      pthread_cond_broadcast (&irq->cv);
+      pthread_mutex_unlock (&irq->lock);
+    }
 }
 
 error_t
-v9p_irq_install (void)
+virtio_irq_install (struct virtio_irq *irq, struct virtio_pci_dev *v,
+                    struct virtio_queue **queues, size_t nqueues)
 {
   pthread_t thread;
   error_t err;
+  size_t k;
+
+  if (nqueues == 0 || nqueues > VIRTIO_IRQ_MAX_QUEUES)
+    return EINVAL;
+
+  irq->pci = v;
+  irq->nqueues = nqueues;
+  for (k = 0; k < nqueues; k++)
+    irq->queues[k] = queues[k];
+  pthread_mutex_init (&irq->lock, NULL);
+  pthread_cond_init (&irq->cv, NULL);
+  irq->config_seq = 0;
 
   err = irqhelp_init ();
   if (err)
     return err;
 
   /* gsi = -1 makes irqhelp translate bus/dev/fun through ACPI.  */
-  v9p_irq = irqhelp_install_interrupt_handler (-1, v9p_dev->bus, v9p_dev->dev,
-                                               v9p_dev->func,
-                                               v9p_irq_handler, NULL);
-  if (!v9p_irq)
+  irq->irq = irqhelp_install_interrupt_handler (-1, v->dev->bus, v->dev->dev,
+                                                v->dev->func,
+                                                virtio_irq_handler, irq);
+  if (!irq->irq)
     {
-      fprintf (stderr, "virtio-9p: irqhelp_install_interrupt_handler "
-              "failed\n");
+      fprintf (stderr, "%s: irqhelp_install_interrupt_handler failed\n",
+               v->name);
       return EIO;
     }
 
-  err = pthread_create (&thread, NULL, irqhelp_server_loop, v9p_irq);
+  err = pthread_create (&thread, NULL, irqhelp_server_loop, irq->irq);
   if (err)
     {
-      v9p_irq_uninstall ();
+      virtio_irq_uninstall (irq);
       return err;
     }
   pthread_detach (thread);
@@ -280,12 +345,37 @@ v9p_irq_install (void)
    exit means the entry never outlives the process with unacked irqs
    pending from our device.  */
 void
-v9p_irq_uninstall (void)
+virtio_irq_uninstall (struct virtio_irq *irq)
 {
-  struct irq *irq = v9p_irq;
-  if (!irq)
+  struct irq *handler = irq->irq;
+  if (!handler)
     return;
-  v9p_irq = NULL;
-  v9p_pci_quiesce ();
-  irqhelp_remove_interrupt_handler (irq);
+  irq->irq = NULL;
+  virtio_pci_quiesce (irq->pci);
+  irqhelp_remove_interrupt_handler (handler);
+}
+
+error_t
+virtio_irq_wait_config (struct virtio_irq *irq, int timeout_sec,
+                        uint32_t *seq)
+{
+  struct timespec deadline;
+  int werr;
+
+  clock_gettime (CLOCK_REALTIME, &deadline);
+  deadline.tv_sec += timeout_sec;
+
+  pthread_mutex_lock (&irq->lock);
+  while (irq->config_seq == *seq)
+    {
+      werr = pthread_cond_timedwait (&irq->cv, &irq->lock, &deadline);
+      if (werr != 0)
+        {
+          pthread_mutex_unlock (&irq->lock);
+          return ETIMEDOUT;
+        }
+    }
+  *seq = irq->config_seq;
+  pthread_mutex_unlock (&irq->lock);
+  return 0;
 }

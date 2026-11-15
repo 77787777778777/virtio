@@ -1,4 +1,4 @@
-/* 9P PDU framing and the Phase 1 selftest.
+/* 9P PDU framing, the request/response exchange, and the Phase 1 selftest.
 
    This file stays a framing layer, not a protocol interpreter: it assembles
    the 4-byte little-endian size prefix, owns the TX/RX DMA buffers through
@@ -42,6 +42,51 @@ get_le32 (const void *p)
 {
   const uint8_t *b = p;
   return b[0] | (b[1] << 8) | (b[2] << 16) | ((uint32_t) b[3] << 24);
+}
+
+/* One request: the complete outbound PDU in TX, reply capacity in RX.  The
+   reply lands in REPLY (up to REPLY_CAP bytes) and its length in REPLY_LEN.
+   Submits the request, then blocks on the interrupt; the timeout is the
+   fallback for a lost interrupt, not the normal path.  */
+error_t
+v9p_exchange (const void *pdu, uint32_t pdu_len,
+              void *reply, uint32_t reply_cap, uint32_t *reply_len)
+{
+  struct virtio_buf bufs[2];
+  struct virtio_used_elem used;
+  uint32_t used_len;
+  error_t err;
+
+  if (pdu_len < 7 || pdu_len > V9P_TX_BUF_SIZE)
+    return EMSGSIZE;
+  if (reply_cap > V9P_RX_BUF_SIZE)
+    return EMSGSIZE;
+
+  memcpy (v9p_dma.tx_buf, pdu, pdu_len);
+
+  bufs[0].addr = v9p_dma.tx_phys;
+  bufs[0].len = pdu_len;
+  bufs[0].flags = 0;
+  bufs[1].addr = v9p_dma.rx_phys;
+  bufs[1].len = reply_cap;
+  bufs[1].flags = VIRTQ_DESC_F_WRITE;
+
+  err = virtio_queue_post (&v9p_q, bufs, 2);
+  if (err)
+    return err;
+  err = virtio_queue_wait_used (&v9p_q, V9P_EXCHANGE_TIMEOUT, &used);
+  if (err)
+    return err;
+  used_len = used.len;
+  if (used_len > reply_cap)
+    {
+      fprintf (stderr, "virtio-9p: reply %u > capacity %u\n",
+               used_len, reply_cap);
+      return EMSGSIZE;
+    }
+  memcpy (reply, v9p_dma.rx_buf, used_len);
+  *reply_len = used_len;
+  return 0;
 }
 
 /* Hand-built Tversion: size[4] type=100[1] tag[2] msize[4] version[2+8].
@@ -89,7 +134,7 @@ v9p_selftest (const char *required_tag)
   }
 
   {
-    uint32_t guest_features = v9p_read_guest_features ();
+    uint32_t guest_features = virtio_pci_read_guest_features (&v9p_pci);
     if (!(guest_features & (1u << V9P_F_MOUNT_TAG)))
       {
         fprintf (stderr, "virtio-9p selftest: mount tag feature not "
@@ -99,7 +144,7 @@ v9p_selftest (const char *required_tag)
   }
 
   {
-    uint32_t pfn = v9p_read_queue_pfn ();
+    uint32_t pfn = virtio_pci_read_queue_pfn (&v9p_pci);
     if (pfn != v9p_vring_phys >> 12)
       {
         fprintf (stderr, "virtio-9p selftest: QUEUE_PFN readback 0x%x != "
@@ -116,7 +161,7 @@ v9p_selftest (const char *required_tag)
       fprintf (stderr, "virtio-9p selftest: negotiated msize %u, expected "
                "%u (transport cap)\n", rmsize, V9P_MSIZE_CAP);
       return EIO;
-    }
+  }
   if (vlen != 8 || memcmp (reply + 13, "9P2000.L", 8) != 0)
     {
       fprintf (stderr, "virtio-9p selftest: bad Rversion version string\n");

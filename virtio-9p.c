@@ -325,6 +325,106 @@ trivfs_S_io_mod_owner (struct trivfs_protid *cred,
   return EINVAL;
 }
 
+/* 9P transport policy over the generic legacy core: the virtio-9p device ID,
+   the required mount-tag feature, and the per-queue TX/RX DMA buffers the
+   exchange posts.  */
+
+struct virtio_pci_dev v9p_pci =
+{
+  .name = "virtio-9p",
+  .device_id = V9P_DEVICE_VIRTIO_9P,
+};
+struct virtio_queue v9p_q;
+struct virtio_irq v9p_irq;
+struct v9p_dma v9p_dma;
+char v9p_tag[V9P_MAX_TAG_LEN + 1];
+uint16_t v9p_tag_len;
+uint64_t v9p_vring_phys;
+
+error_t
+v9p_pci_probe (const char *override)
+{
+  return virtio_pci_probe (&v9p_pci, override);
+}
+
+/* Reset, ACKNOWLEDGE, DRIVER, require and acknowledge the mount-tag
+   feature, read the config region.  Queue programming and DRIVER_OK happen
+   after this returns, in that order.  */
+error_t
+v9p_pci_init (void)
+{
+  uint32_t features;
+
+  virtio_pci_reset (&v9p_pci);
+  virtio_pci_set_driver (&v9p_pci);
+
+  features = virtio_pci_read_host_features (&v9p_pci);
+  if (!(features & (1u << V9P_F_MOUNT_TAG)))
+    {
+      fprintf (stderr, "virtio-9p: device does not offer VIRTIO_9P_MOUNT_TAG\n");
+      return ENODEV;
+    }
+  /* Writing guest_features = 0 would leave the mount tag undefined.  */
+  virtio_pci_set_guest_features (&v9p_pci, 1u << V9P_F_MOUNT_TAG);
+
+  v9p_tag_len = virtio_pci_inw (&v9p_pci, VIRTIO_PCI_CONFIG);
+  if (v9p_tag_len == 0 || v9p_tag_len > V9P_MAX_TAG_LEN)
+    {
+      fprintf (stderr, "virtio-9p: implausible tag_len %u\n", v9p_tag_len);
+      return EIO;
+    }
+  {
+    unsigned i;
+    for (i = 0; i < v9p_tag_len; i++)
+      v9p_tag[i] = virtio_pci_inb (&v9p_pci, VIRTIO_PCI_CONFIG + 2 + i);
+  }
+  v9p_tag[v9p_tag_len] = '\0';
+
+  fprintf (stderr, "virtio-9p: mount tag \"%s\"\n", v9p_tag);
+  /* Ack any interrupt the handshake itself raised.  */
+  virtio_pci_read_isr (&v9p_pci);
+  return 0;
+}
+
+error_t
+v9p_queue_setup (void)
+{
+  error_t err;
+
+  err = virtio_queue_setup (&v9p_pci, &v9p_q, 0);
+  if (err)
+    return err;
+
+  err = virtio_dma_alloc (&v9p_pci, V9P_TX_BUF_SIZE,
+                          (void **) &v9p_dma.tx_buf, &v9p_dma.tx_phys);
+  if (err)
+    return err;
+  err = virtio_dma_alloc (&v9p_pci, V9P_RX_BUF_SIZE,
+                          (void **) &v9p_dma.rx_buf, &v9p_dma.rx_phys);
+  if (err)
+    return err;
+
+  v9p_vring_phys = v9p_q.region_phys;
+  fprintf (stderr, "virtio-9p: queue 0 TX/RX 0x%llx/0x%llx\n",
+           (unsigned long long) v9p_dma.tx_phys,
+           (unsigned long long) v9p_dma.rx_phys);
+  return 0;
+}
+
+error_t
+v9p_irq_install (void)
+{
+  struct virtio_queue *queues[] = { &v9p_q };
+
+  return virtio_irq_install (&v9p_irq, &v9p_pci, queues, 1);
+}
+
+void
+v9p_irq_uninstall (void)
+{
+  virtio_irq_uninstall (&v9p_irq);
+}
+
 static error_t
 v9p_start_device (void)
 {
@@ -339,7 +439,7 @@ v9p_start_device (void)
   err = v9p_queue_setup ();
   if (err)
     return err;
-  err = v9p_pci_driver_ok ();
+  err = virtio_pci_driver_ok (&v9p_pci);
   if (err)
     return err;
   err = v9p_irq_install ();

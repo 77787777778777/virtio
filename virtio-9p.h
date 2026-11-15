@@ -5,41 +5,24 @@
 
    Boundary conventions: the legacy PCI interface (BAR0 in I/O space), one
    split virtqueue, one outstanding PDU, and a byte-stream front end for the
-   unmodified 9pfs translator.  */
+   unmodified 9pfs translator.  The transport is the generic legacy virtio
+   PCI core (virtio-pci.c, virtio-queue.c); this header keeps the 9p-specific
+   policy (device ID, mount tag, msize caps) and the adapter entry points.  */
 
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/types.h>
 #include <pciaccess.h>
 #include <hurd.h>
 
-/* Legacy virtio PCI register offsets within BAR0 (no MSI-X).  */
-#define V9P_PCI_HOST_FEATURES  0x00
-#define V9P_PCI_GUEST_FEATURES 0x04
-#define V9P_PCI_QUEUE_PFN      0x08
-#define V9P_PCI_QUEUE_NUM      0x0c
-#define V9P_PCI_QUEUE_SEL      0x0e
-#define V9P_PCI_QUEUE_NOTIFY   0x10
-#define V9P_PCI_STATUS         0x12
-#define V9P_PCI_ISR            0x13
-#define V9P_PCI_CONFIG         0x14
-
-/* Virtio 1.0 legacy device status bits.  */
-#define V9P_S_ACKNOWLEDGE 1
-#define V9P_S_DRIVER      2
-#define V9P_S_DRIVER_OK   4
+#include "virtio-pci.h"
+#include "virtio-queue.h"
 
 /* VIRTIO_9P_MOUNT_TAG is feature bit 0 and is required: without it the
    mount tag is not delivered.  */
 #define V9P_F_MOUNT_TAG 0
 
-#define V9P_VENDOR_REDHAT_QUMRANET 0x1af4
-#define V9P_DEVICE_VIRTIO_9P       0x1009
-
-/* Virtqueue geometry: QEMU's virtio-9p device offers a single queue of 128.  */
-#define V9P_QUEUE_MAX 128
-/* Per-exchange bound on the interrupt wait; the fallback for a lost
-   interrupt, not the normal completion path.  */
-#define V9P_EXCHANGE_TIMEOUT 30
+#define V9P_DEVICE_VIRTIO_9P 0x1009
 
 /* QEMU's virtio-9p transport caps the negotiated msize at
    (VIRTQUEUE_MAX_SIZE - 2) * 4096, and 9pfs issues PDUs close to that, so
@@ -54,65 +37,37 @@
 #define V9P_MAX_TAG_LEN 32
 #define V9P_DEFAULT_MOUNT_TAG "hostshare"
 
-/* Descriptor flags.  WRITE means "the device writes this buffer", so the
-   request chain never has it and the reply chain always does.  */
-#define V9P_DESC_F_NEXT  1
-#define V9P_DESC_F_WRITE 2
+/* Per-exchange bound on the interrupt wait; the fallback for a lost
+   interrupt, not the normal completion path.  */
+#define V9P_EXCHANGE_TIMEOUT 30
 
-struct v9p_desc {
-  uint64_t addr;
-  uint32_t len;
-  uint16_t flags;
-  uint16_t next;
+/* The TX/RX DMA buffers of the single 9P exchange, allocated by
+   v9p_queue_setup and used by v9p_exchange.  */
+struct v9p_dma {
+  uint8_t *tx_buf;
+  uint8_t *rx_buf;
+  uint64_t tx_phys;
+  uint64_t rx_phys;
 };
 
-struct v9p_used_elem {
-  uint32_t id;
-  uint32_t len;
-};
-
-struct v9p_vring {
-  uint16_t num;
-  struct v9p_desc *desc;
-  volatile uint16_t *avail_idx;
-  uint16_t *avail_ring;
-  volatile uint16_t *used_idx;
-  struct v9p_used_elem *used_ring;
-  uint16_t last_used;
-};
-
-/* virtio-pci.c */
-extern struct pci_device *v9p_dev;
-extern pciaddr_t v9p_io_base;
-extern pciaddr_t v9p_io_size;
+extern struct virtio_pci_dev v9p_pci;
+extern struct virtio_queue v9p_q;
+extern struct virtio_irq v9p_irq;
+extern struct v9p_dma v9p_dma;
 extern char v9p_tag[V9P_MAX_TAG_LEN + 1];
 extern uint16_t v9p_tag_len;
+extern uint64_t v9p_vring_phys;
 
-/* Legacy register access on the I/O BAR.  */
-void v9p_outb (int off, uint8_t v);
-void v9p_outw (int off, uint16_t v);
-void v9p_outl (int off, uint32_t v);
-uint8_t v9p_inb (int off);
-uint16_t v9p_inw (int off);
-uint32_t v9p_inl (int off);
-
+/* virtio-9p.c */
 error_t v9p_pci_probe (const char *override);
 error_t v9p_pci_init (void);
-error_t v9p_pci_driver_ok (void);
-void v9p_pci_quiesce (void);
-uint32_t v9p_read_guest_features (void);
-uint8_t v9p_read_isr (void);
-
-/* virtio-queue.c */
 error_t v9p_queue_setup (void);
 error_t v9p_irq_install (void);
 void v9p_irq_uninstall (void);
-error_t v9p_exchange (const void *pdu, uint32_t pdu_len,
-                      void *reply, uint32_t reply_cap, uint32_t *reply_len);
-extern uint64_t v9p_vring_phys;
-uint32_t v9p_read_queue_pfn (void);
 
 /* virtio-9p-req.c */
+error_t v9p_exchange (const void *pdu, uint32_t pdu_len,
+                      void *reply, uint32_t reply_cap, uint32_t *reply_len);
 error_t v9p_selftest (const char *required_tag);
 
 /* virtio-9p-ios.c */
