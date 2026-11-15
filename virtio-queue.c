@@ -265,9 +265,27 @@ v9p_irq_install (void)
   err = pthread_create (&thread, NULL, irqhelp_server_loop, v9p_irq);
   if (err)
     {
-      irqhelp_remove_interrupt_handler (v9p_irq);
+      v9p_irq_uninstall ();
       return err;
     }
   pthread_detach (thread);
   return 0;
+}
+
+/* Idempotent.  Order mirrors NetBSD's virtio_child_detach: reset the
+   device first (stops new INTx asserts and clears the ISR), then drop the
+   handler.  Dropping the receive right marks the kernel-side user_intr_t
+   dead; gnumach has no device_intr_unregister RPC, so intr_thread reaps
+   the entry (and unmasks the line) on its next sweep.  Doing this before
+   exit means the entry never outlives the process with unacked irqs
+   pending from our device.  */
+void
+v9p_irq_uninstall (void)
+{
+  struct irq *irq = v9p_irq;
+  if (!irq)
+    return;
+  v9p_irq = NULL;
+  v9p_pci_quiesce ();
+  irqhelp_remove_interrupt_handler (irq);
 }

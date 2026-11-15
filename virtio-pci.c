@@ -206,6 +206,19 @@ v9p_pci_driver_ok (void)
   return 0;
 }
 
+/* Teardown-side mirror of v9p_pci_init: writing 0 to the status register
+   is the legacy-virtio device reset.  QEMU answers by clearing the ISR
+   register and deasserting INTx, so no new interrupt from this device can
+   be raised or delivered after this point.  This must precede IRQ handler
+   removal, mirroring the reset-then-free-interrupts order of NetBSD's
+   virtio_child_detach and Linux's virtio_dev_remove.  */
+void
+v9p_pci_quiesce (void)
+{
+  v9p_outb (V9P_PCI_STATUS, 0);
+  usleep (10 * 1000);
+}
+
 uint32_t
 v9p_read_guest_features (void)
 {

@@ -99,12 +99,14 @@ uint32_t v9p_inl (int off);
 error_t v9p_pci_probe (const char *override);
 error_t v9p_pci_init (void);
 error_t v9p_pci_driver_ok (void);
+void v9p_pci_quiesce (void);
 uint32_t v9p_read_guest_features (void);
 uint8_t v9p_read_isr (void);
 
 /* virtio-queue.c */
 error_t v9p_queue_setup (void);
 error_t v9p_irq_install (void);
+void v9p_irq_uninstall (void);
 error_t v9p_exchange (const void *pdu, uint32_t pdu_len,
                       void *reply, uint32_t reply_cap, uint32_t *reply_len);
 extern uint64_t v9p_vring_phys;

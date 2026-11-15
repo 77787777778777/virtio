@@ -121,6 +121,7 @@ trivfs_modify_stat (struct trivfs_protid *cred, io_statbuf_t *st)
 error_t
 trivfs_goaway (struct trivfs_control *fsys, int flags)
 {
+  v9p_irq_uninstall ();
   exit (0);
 }
 
@@ -344,7 +345,13 @@ v9p_start_device (void)
   err = v9p_irq_install ();
   if (err)
     return err;
-  return v9p_ios_init ();
+  err = v9p_ios_init ();
+  if (err)
+    {
+      v9p_irq_uninstall ();
+      return err;
+    }
+  return 0;
 }
 
 int
@@ -365,6 +372,7 @@ main (int argc, char **argv)
       if (err)
         error (1, err, "selftest failed");
       printf ("selftest ok\n");
+      v9p_irq_uninstall ();
       return 0;
     }
 
