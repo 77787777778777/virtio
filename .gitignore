@@ -1,3 +1,4 @@
 *.o
 virtio-9p
 virtio-balloon
+virtio-blk

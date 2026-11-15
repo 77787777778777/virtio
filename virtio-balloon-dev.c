@@ -16,23 +16,14 @@
 
 /* The legacy balloon config region and the PFN arrays are little-endian
    on the wire (the balloon device is the documented exception among virtio
-   devices), independent of guest native endianness.  */
-static void
-put_le32 (void *p, uint32_t v)
-{
-  uint8_t *b = p;
-  b[0] = v;
-  b[1] = v >> 8;
-  b[2] = v >> 16;
-  b[3] = v >> 24;
-}
-
+   devices), independent of guest native endianness; the encoding helpers
+   live with the shared transport.  */
 static void
 put_pfns (uint32_t *dst, const uint32_t *pfns, uint32_t count)
 {
   uint32_t i;
   for (i = 0; i < count; i++)
-    put_le32 (dst + i, pfns[i]);
+    virtio_put_le32 (dst + i, pfns[i]);
 }
 
 error_t

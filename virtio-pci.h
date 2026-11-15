@@ -84,4 +84,26 @@ void virtio_pci_write_config (struct virtio_pci_dev *, int off, uint32_t val);
 uint16_t virtio_pci_read_queue_num (struct virtio_pci_dev *);
 uint32_t virtio_pci_read_queue_pfn (struct virtio_pci_dev *);
 
+/* Virtio wire fields are little-endian regardless of guest native
+   endianness.  The host is x86_64, but the helpers keep every wire
+   field write explicit; shared by the device drivers that build
+   request or config structures by hand.  */
+static inline void
+virtio_put_le32 (void *p, uint32_t v)
+{
+  uint8_t *b = p;
+  b[0] = v;
+  b[1] = v >> 8;
+  b[2] = v >> 16;
+  b[3] = v >> 24;
+}
+
+static inline void
+virtio_put_le64 (void *p, uint64_t v)
+{
+  uint8_t *b = p;
+  virtio_put_le32 (b, (uint32_t) v);
+  virtio_put_le32 (b + 4, (uint32_t) (v >> 32));
+}
+
 #endif /* VIRTIO_PCI_H */

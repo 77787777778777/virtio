@@ -2,7 +2,7 @@
 
 Userspace virtio drivers for GNU Hurd. AI patches are ENCOURAGED.
 
-Two separate daemons share the generic legacy virtio PCI transport
+Two separate programs share the generic legacy virtio PCI transport
 (`virtio-pci.c`, `virtio-queue.c`) and run as independent processes, each
 probing and owning its own PCI device:
 
@@ -12,10 +12,16 @@ probing and owning its own PCI device:
 - `virtio-balloon` makes the guest participate in virtio memory ballooning
   through QEMU's virtio-balloon PCI device (`0x1af4:0x1002`), so the host
   can dynamically reclaim or return guest RAM at runtime.
+- `virtio-blk` performs raw block I/O on QEMU's virtio-blk PCI device
+  (`0x1af4:0x1001`), through the Mach device semantics layer (recnum /
+  record_size units, `DEV_GET_SIZE` / `DEV_GET_RECORDS`, the `D_*` error
+  codes) that libstore/storeio consumers expect; publishing the device
+  under a name is the next phase, so the datapath is driven by
+  `--selftest` for now.
 
 ## How it works
 
-Both drivers use the same transport: PCI discovery through libpciaccess (a
+All drivers use the same transport: PCI discovery through libpciaccess (a
 pci-arbiter client, so the guest must run the pci-arbiter translator and
 the driver must not touch the PCI config ports itself), the legacy virtio
 register interface in an I/O BAR, the reset/ACK/DRIVER/feature/DRIVER_OK
@@ -55,8 +61,9 @@ https://github.com/hurdkit/hurdkit/ has a `virtio-9p` target that sets
 CC/CPATH/LIBS; for a manual build, set them the same way.
 
 ```
-make                     # builds virtio-9p and virtio-balloon
+make                     # builds virtio-9p, virtio-balloon and virtio-blk
 make virtio-balloon      # balloon driver only
+make virtio-blk          # block driver only
 make CFLAGS=-g           # debugging build
 ```
 
@@ -144,6 +151,80 @@ is reusable. The page pool is driver-owned `vm_allocate_contiguous` chunks
 of 16 pages; chunk granularity and allocation failures bound the reachable
 balloon size. The convergence loop wakes on config-change interrupts with a
 1 s tick, and shutdown deflates best-effort before resetting the device.
+
+## virtio-blk usage
+
+On the host, start QEMU with a disk backend and the device (a disposable
+image for anything that writes):
+
+```
+-drive if=none,id=vd0,file=disk.img,format=raw,cache=none
+-device virtio-blk-pci,drive=vd0
+```
+
+In the guest, run the selftest to prove the datapath end to end:
+
+```
+# /hurd/virtio-blk --selftest
+```
+
+Options:
+
+- `--device=SLOT`: use the virtio-blk device at this PCI slot instead of
+  the first match
+- `--selftest`: bring the device up, verify the handshake, features, queue
+  and config, read sector 0, prove the read-past-capacity bound, and
+  exercise the Mach device semantics layer (size/records consistency, open
+  modes, unit and range errors, flush flavor, inband/map refusals)
+- `--write-test`: with `--selftest`, also write a pattern to sector 0,
+  flush, and read it back; destroys the first sector of the backing image,
+  so use a disposable image
+- `--status`: print the device's capacity, offered features and limits and
+  exit; reads the config region only, so it never resets or disturbs a
+  running driver
+- `--read-range=SECTOR[:COUNT]`: read COUNT sectors (default 1) at SECTOR
+  through the normal request path and write the raw bytes to standard
+  output (diagnostics go to stderr); a debugging aid for harness data
+  checks, capped at 64 MiB per invocation
+- `--verbose`: log every request posting and completion
+
+Without options the driver is a long-lived daemon: it owns the device,
+logs config-change interrupts and capacity changes, and prints I/O
+counters on exit. Runtime logs (stderr) show offered/accepted features,
+capacity, limits, and every error.
+
+## virtio-blk protocol notes
+
+MVP scope is legacy PCI transport, single request queue (virtqueue 0), and
+the `VIRTIO_BLK_T_IN`/`T_OUT`/`T_FLUSH` request types only; no MQ, SCSI
+passthrough, topology, discard/write-zeroes/zoned, or modern transport.
+Accepted features are exactly the implemented ones, each with matching
+behavior: `VIRTIO_BLK_F_RO` rejects writes, `VIRTIO_BLK_F_FLUSH` serves
+`DEV_FLUSH_CACHE`, `VIRTIO_BLK_F_SIZE_MAX`/`_SEG_MAX` bound requests, and
+`VIRTIO_BLK_F_BLK_SIZE` sets the transfer unit; anything else offered is
+rejected.
+
+Each request is one descriptor chain over a fixed-layout DMA slot:
+`virtio_blk_outhdr` (type, ioprio, sector in 512-byte units) as a
+device-readable buffer, the data buffer in the transfer direction, and the
+1-byte device-written status last. Completions are validated defensively
+(descriptor head, used length, status byte) and mapped to errno (`S_OK` to
+success, `S_IOERR` to `EIO`, `S_UNSUPP` to `EOPNOTSUPP`). The Mach device
+semantics layer on top reports `record_size` 512 (or the negotiated
+blk_size), keeps `DEV_GET_SIZE`/`DEV_GET_RECORDS` consistent by
+construction, maps `recnum` records to virtio sectors, and answers
+unexpected flavors/modes with `D_INVALID_OPERATION` rather than crashing.
+I/O is serialized per the MVP; the request table is keyed by descriptor
+head, so in-flight concurrency can be added without changing the
+completion path.
+
+Field layouts, feature bits, and request/status values follow QEMU's
+`include/standard-headers/linux/virtio_blk.h` (the guest-visible contract,
+cited with anchors in `stuff/virtio_disk_plan.md` §4); the Mach RPC shapes
+and `D_*` codes follow gnumach's `include/device/device.defs` and
+`include/device/device_types.h`, with `hurd/libstore/device.c` as the
+consumer baseline; the virtio specification's legacy PCI transport and
+Block Device sections arbitrate any disagreement.
 
 ## Why not NetBSD's vio9p
 
