@@ -170,6 +170,11 @@ void vblk_stop_device (void);
 error_t vblk_selftest (int write_test);
 error_t vblk_status (const char *override);
 
+/* virtio-blk-serve.c: MIG device server / trivfs translator (Stage C).
+   Brings up no device itself: DEV must be initialized already.  Never
+   returns; exits when trivfs_goaway tears the translator down.  */
+void vblk_serve (struct vblk_dev *dev, const char *name);
+
 /* virtio-blk-dev.c */
 error_t vblk_dev_init (struct vblk_dev *, const char *override);
 void vblk_dev_quiesce (struct vblk_dev *);

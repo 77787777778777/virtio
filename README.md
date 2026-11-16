@@ -13,11 +13,9 @@ probing and owning its own PCI device:
   through QEMU's virtio-balloon PCI device (`0x1af4:0x1002`), so the host
   can dynamically reclaim or return guest RAM at runtime.
 - `virtio-blk` performs raw block I/O on QEMU's virtio-blk PCI device
-  (`0x1af4:0x1001`), through the Mach device semantics layer (recnum /
+  (`0x1af4:0x1001`), exposing record-based block access (recnum /
   record_size units, `DEV_GET_SIZE` / `DEV_GET_RECORDS`, the `D_*` error
-  codes) that libstore/storeio consumers expect; publishing the device
-  under a name is the next phase, so the datapath is driven by
-  `--selftest` for now.
+  codes) that libstore/storeio consumers expect.
 
 ## How it works
 
@@ -61,9 +59,11 @@ https://github.com/hurdkit/hurdkit/ has a `virtio-9p` target that sets
 CC/CPATH/LIBS; for a manual build, set them the same way.
 
 ```
-make                     # builds virtio-9p, virtio-balloon and virtio-blk
+make                     # builds virtio-9p, virtio-balloon, virtio-blk
+                         # and the vblk-client harness client
 make virtio-balloon      # balloon driver only
 make virtio-blk          # block driver only
+make vblk-client         # direct Mach device RPC client only
 make CFLAGS=-g           # debugging build
 ```
 
@@ -174,8 +174,8 @@ Options:
   the first match
 - `--selftest`: bring the device up, verify the handshake, features, queue
   and config, read sector 0, prove the read-past-capacity bound, and
-  exercise the Mach device semantics layer (size/records consistency, open
-  modes, unit and range errors, flush flavor, inband/map refusals)
+  exercise block access (size/records consistency, open modes, unit and
+  range errors, flush flavor, inband/map refusals)
 - `--write-test`: with `--selftest`, also write a pattern to sector 0,
   flush, and read it back; destroys the first sector of the backing image,
   so use a disposable image
@@ -209,8 +209,8 @@ Each request is one descriptor chain over a fixed-layout DMA slot:
 device-readable buffer, the data buffer in the transfer direction, and the
 1-byte device-written status last. Completions are validated defensively
 (descriptor head, used length, status byte) and mapped to errno (`S_OK` to
-success, `S_IOERR` to `EIO`, `S_UNSUPP` to `EOPNOTSUPP`). The Mach device
-semantics layer on top reports `record_size` 512 (or the negotiated
+success, `S_IOERR` to `EIO`, `S_UNSUPP` to `EOPNOTSUPP`). On top of this
+layer, block access reports `record_size` 512 (or the negotiated
 blk_size), keeps `DEV_GET_SIZE`/`DEV_GET_RECORDS` consistent by
 construction, maps `recnum` records to virtio sectors, and answers
 unexpected flavors/modes with `D_INVALID_OPERATION` rather than crashing.

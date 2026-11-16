@@ -27,7 +27,9 @@ int vblk_verbose;
 enum {
   OPT_STATUS = 1000,
   OPT_WRITE_TEST,
-  OPT_READ_RANGE
+  OPT_READ_RANGE,
+  OPT_SERVE,
+  OPT_NAME
 };
 
 static const char *opt_device;
@@ -35,6 +37,8 @@ static int opt_selftest;
 static int opt_status;
 static int opt_write_test;
 static const char *opt_read_range;
+static int opt_serve;
+static const char *opt_name;
 
 static const struct argp_option options[] =
 {
@@ -52,6 +56,13 @@ static const struct argp_option options[] =
   {"read-range", OPT_READ_RANGE, "SECTOR[:COUNT]", 0,
    "Read COUNT sectors (default 1) at SECTOR and write the raw bytes to "
    "standard output, then exit; a debugging aid for harness data checks"},
+  {"serve", OPT_SERVE, 0, 0,
+   "Run as a Mach device translator (settrans): answer device_open/read/"
+   "write/status on the node; requires the bootstrap port of a "
+   "translator startup"},
+  {"name", OPT_NAME, "NAME", 0,
+   "With --serve: only accept device_open for this name (default: accept "
+   "any, including the empty rest of libstore's `@node:' form)"},
   {"verbose", 'v', 0, 0,
    "Log every request posting and completion"},
   {0}
@@ -80,6 +91,12 @@ parse_opt (int key, char *arg, struct argp_state *state)
     case OPT_READ_RANGE:
       opt_read_range = arg;
       break;
+    case OPT_SERVE:
+      opt_serve = 1;
+      break;
+    case OPT_NAME:
+      opt_name = arg;
+      break;
     default:
       return ARGP_ERR_UNKNOWN;
     }
@@ -93,8 +110,8 @@ static const struct argp argp =
   "[--device=SLOT] [--selftest [--write-test]] [--status] "
   "[--read-range=SECTOR[:COUNT]] [--verbose]",
   "Virtio block driver: raw block I/O on QEMU's virtio-blk PCI device "
-  "(0x1af4:0x1001), with the Mach device semantics layer for Hurd "
-  "storage consumers"
+  "(0x1af4:0x1001), with the Mach device semantics layer and a Mach "
+  "device translator mode for Hurd storage consumers"
 };
 
 static struct vblk_dev vblk;
@@ -545,6 +562,9 @@ main (int argc, char **argv)
   if (opt_write_test && !opt_selftest)
     error (1, 0, "--write-test only applies to --selftest");
 
+  if (opt_name && !opt_serve)
+    error (1, 0, "--name only applies to --serve");
+
   if (opt_read_range)
     {
       read_range (opt_read_range);
@@ -574,6 +594,17 @@ main (int argc, char **argv)
       printf ("selftest ok\n");
       vblk_stop_device ();
       return 0;
+    }
+
+  if (opt_serve)
+    {
+      /* Stage C: become the Mach device translator.  Bring-up failure
+         is fatal before trivfs_startup replies to the parent, so
+         settrans reports it instead of hanging on a dead node.  */
+      err = vblk_start_device (opt_device);
+      if (err)
+        error (4, err, "virtio-blk device not usable");
+      vblk_serve (&vblk, opt_name);
     }
 
   sa.sa_handler = quit_handler;

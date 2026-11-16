@@ -1,4 +1,11 @@
 *.o
+*.d
+*.sdefsi
+deviceServer.c
+device_S.h
+notifyServer.c
+notify_S.h
 virtio-9p
 virtio-balloon
 virtio-blk
+vblk-client
