@@ -51,6 +51,12 @@ struct virtio_pci_dev {
   struct pci_device *dev;
   pciaddr_t io_base;
   pciaddr_t io_size;
+  /* Set once probe finished and the registers are usable.  The
+     bring-up-failure paths reset through this struct, and reset/quiesce
+     must refuse to do raw port I/O before that: io_base would be
+     garbage and the ioperm was never granted, so the write would fault
+     instead of returning the probe error.  */
+  int probed;
   /* Log prefix and the virtio PCI device ID to match, set by the driver.  */
   const char *name;
   uint16_t device_id;

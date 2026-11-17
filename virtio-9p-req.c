@@ -76,7 +76,10 @@ v9p_exchange (const void *pdu, uint32_t pdu_len,
     return err;
   err = virtio_queue_wait_used (&v9p_q, V9P_EXCHANGE_TIMEOUT, &used);
   if (err)
-    return err;
+    {
+      fprintf (stderr, "virtio-9p: reply wait failed: %s\n", strerror (err));
+      return err;
+    }
   used_len = used.len;
   if (used_len > reply_cap)
     {

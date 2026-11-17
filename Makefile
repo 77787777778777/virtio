@@ -8,7 +8,7 @@
 CC ?= cc
 CFLAGS ?= -O2 -g -Wall
 
-all: virtio-9p virtio-balloon virtio-blk vblk-client
+all: virtio-9p virtio-balloon virtio-blk vblk-client virtio-net vnet-client
 
 # The transport core is shared by all drivers; the 9p translator adds the
 # trivfs/ports stack, the daemons link lean.
@@ -27,8 +27,18 @@ LIBS_CLIENT = hurduser machuser
 OBJS9P = virtio-9p.o virtio-9p-req.o virtio-9p-ios.o $(TRANSPORT)
 OBJSBAL = virtio-balloon.o virtio-balloon-dev.o virtio-balloon-mem.o \
           $(TRANSPORT)
+# The shared slot-pool engine (virtio-pool.c) and the shared translator
+# scaffold (virtio-serve.c) are linked by blk and net.
 OBJSBLK = virtio-blk.o virtio-blk-dev.o virtio-blk-req.o virtio-blk-hurd.o \
-          virtio-blk-serve.o deviceServer.o notifyServer.o $(TRANSPORT)
+          virtio-blk-serve.o deviceServer.o notifyServer.o virtio-pool.o \
+          virtio-serve.o $(TRANSPORT)
+# virtio-net links the trivfs/ports stack too: the binary doubles as the
+# Mach device translator (`--serve`), and it compiles in the pinned Hurd
+# tree's libbpf (bpf_impl.c + queue.c) for real filter evaluation, the
+# same substrate eth-multiplexer uses.
+OBJSNET = virtio-net.o virtio-net-dev.o virtio-net-buf.o virtio-net-hurd.o \
+          virtio-net-serve.o vnetDeviceServer.o vnetNotifyServer.o \
+          bpf_impl.o queue.o virtio-pool.o virtio-serve.o $(TRANSPORT)
 
 # MIG server stubs, generated the way the Hurd tree's Makeconf does it
 # (cpp pass with -DSERVERPREFIX=S_, then `mig -ccat -subrprefix __`).
@@ -61,8 +71,18 @@ virtio-balloon: $(OBJSBAL)
 virtio-blk: $(OBJSBLK)
 	$(CC) $(CFLAGS) $^ -o $@ -pthread $(foreach LIB,$(LIBS_BLK),-l$(LIB))
 
+virtio-net: $(OBJSNET)
+	$(CC) $(CFLAGS) $^ -o $@ -pthread $(foreach LIB,$(LIBS_BLK),-l$(LIB))
+
 vblk-client: vblk-client.o
 	$(CC) $(CFLAGS) $^ -o $@ $(foreach LIB,$(LIBS_CLIENT),-l$(LIB))
+
+# vnet-client is a plain RPC client: file_name_lookup (hurduser),
+# device_* (machuser), vm_deallocate (mach).
+LIBS_VNET_CLIENT = hurduser machuser
+
+vnet-client: vnet-client.o
+	$(CC) $(CFLAGS) $^ -o $@ $(foreach LIB,$(LIBS_VNET_CLIENT),-l$(LIB))
 
 # device.defs (subsystem 2800) carries device_open_new only under
 # DEVICE_ENABLE_DEVICE_OPEN_NEW; with it, ds_device_open_new is
@@ -86,23 +106,72 @@ notifyServer.c notify_S.h: notify.sdefsi
 	$(MIG) $(MIGCOMFLAGS) -sheader notify_S.h -server notifyServer.c \
 	    -user /dev/null -header /dev/null $<
 
+# The net server needs its own mutation file (different per-binary
+# imports than blk's), so its defs pass mirrors the blk one with
+# -imacros vnet-mutate.h and vnet-prefixed outputs.
+MIGCPPFLAGS_NET = -I$(HURD_PREFIX)/include -imacros vnet-mutate.h \
+                  -DMACH_PAYLOAD_TO_PORT=ports_payload_get_name
+DEFS_CPPFLAGS_NET = $(MIGCPPFLAGS_NET) -DDEVICE_ENABLE_DEVICE_OPEN_NEW \
+                    -DHURD_SERVER=1 -DSERVERPREFIX=S_
+
+vnet-device.sdefsi: $(HURD_PREFIX)/include/device/device.defs vnet-mutate.h
+	$(MIG_CPP) $(DEFS_CPPFLAGS_NET) -MD -MF $@.d $< -o $@
+
+vnetDeviceServer.c vnet-device_S.h: vnet-device.sdefsi
+	$(MIG) $(MIGCOMFLAGS) -sheader vnet-device_S.h \
+	    -server vnetDeviceServer.c -user /dev/null -header /dev/null $<
+
+vnet-notify.sdefsi: $(HURD_PREFIX)/include/mach/notify.defs
+	$(MIG_CPP) $(DEFS_CPPFLAGS_NET) -MD -MF $@.d $< -o $@
+
+vnetNotifyServer.c vnet-notify_S.h: vnet-notify.sdefsi
+	$(MIG) $(MIGCOMFLAGS) -sheader vnet-notify_S.h \
+	    -server vnetNotifyServer.c -user /dev/null -header /dev/null $<
+
 %.o: %.c virtio-pci.h virtio-queue.h virtio-9p.h virtio-balloon.h \
-     virtio-blk.h virtio-blk-serve.h
+     virtio-blk.h virtio-blk-serve.h virtio-net.h
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -c $< -o $@
+
+# The MIG stubs include "vnet-device_S.h"/"vnet-notify_S.h" (generated
+# here) and libports/ports.h + libports/mig-decls.h (not installed in
+# the prefix; they live in the pinned Hurd source tree).  The _S.h
+# headers carry the same imports, so virtio-net-serve.o needs the paths
+# too.  All net objects include <bpf_impl.h> through virtio-net.h, from
+# the pinned tree's libbpf directory.
+vnetDeviceServer.o vnetNotifyServer.o virtio-net-serve.o: \
+    CFLAGS += -I. -I$(HURD_SRC)
+virtio-net.o virtio-net-dev.o virtio-net-buf.o virtio-net-hurd.o \
+virtio-net-serve.o vnetDeviceServer.o vnetNotifyServer.o: \
+    CFLAGS += -I$(HURD_SRC)/libbpf
+vnetDeviceServer.o vnetNotifyServer.o virtio-net-serve.o: \
+    virtio-net-serve.h
+virtio-net-serve.o: vnet-device_S.h vnet-notify_S.h
+
+# libbpf compiled from the pinned Hurd tree into local objects, so the
+# shared 3p checkout is not polluted with build products.
+bpf_impl.o: $(HURD_SRC)/libbpf/bpf_impl.c
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I$(HURD_SRC)/libbpf -c $< -o $@
+
+queue.o: $(HURD_SRC)/libbpf/queue.c
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I$(HURD_SRC)/libbpf -c $< -o $@
 
 # The MIG stubs include "device_S.h"/"notify_S.h" (generated here) and
 # libports/ports.h + libports/mig-decls.h (not installed in the prefix;
 # they live in the pinned Hurd source tree).  The _S.h headers carry the
 # same imports, so virtio-blk-serve.o needs the paths too.
 deviceServer.o notifyServer.o virtio-blk-serve.o: virtio-blk-serve.h
-deviceServer.o notifyServer.o virtio-blk-serve.o: \
+deviceServer.o notifyServer.o virtio-blk-serve.o virtio-serve.o: \
     CFLAGS += -I. -I$(HURD_SRC)
 virtio-blk-serve.o: device_S.h notify_S.h
+virtio-serve.o: virtio-serve.h
 
 clean:
-	rm -f $(OBJS9P) $(OBJSBAL) $(OBJSBLK) virtio-9p virtio-balloon \
-	    virtio-blk vblk-client vblk-client.o device.sdefsi* \
-	    deviceServer.c device_S.h notify.sdefsi* notifyServer.c \
-	    notify_S.h
+	rm -f $(OBJS9P) $(OBJSBAL) $(OBJSBLK) $(OBJSNET) virtio-pool.o virtio-9p \
+	    virtio-balloon virtio-blk vblk-client vblk-client.o virtio-net \
+	    vnet-client vnet-client.o \
+	    device.sdefsi* deviceServer.c device_S.h notify.sdefsi* \
+	    notifyServer.c notify_S.h vnet-device.sdefsi* vnetDeviceServer.c \
+	    vnet-device_S.h vnet-notify.sdefsi* vnetNotifyServer.c \
+	    vnet-notify_S.h
 
 .PHONY: clean all

@@ -44,6 +44,7 @@
 
 #include "virtio-pci.h"
 #include "virtio-queue.h"
+#include "virtio-pool.h"
 
 /* PCI 0x1af4:0x1001 (PCI_DEVICE_ID_VIRTIO_BLOCK), virtio device ID 2.
    The probe matches on vendor/device ID, not PCI class, which QEMU sets
@@ -102,9 +103,6 @@
 #define VBLK_SLOT_SIZE (VBLK_HDR_SIZE + VBLK_DATA_MAX + 1)
 #define VBLK_MAX_REQ 8
 
-/* Sentinel for "no slot"; valid slots are below VBLK_MAX_REQ.  */
-#define VBLK_NO_SLOT 0xffff
-
 /* Per-request interrupt wait; the fallback for a lost interrupt, not the
    normal completion path.  */
 #define VBLK_TIMEOUT 30
@@ -136,14 +134,15 @@ struct vblk_dev {
   uint64_t size_bytes;
   uint32_t max_transfer; /* effective per-request data cap, bytes */
 
-  /* Request pool: one contiguous DMA region of VBLK_MAX_REQ slots, plus
-     the head-descriptor-to-slot map completions are validated against.
-     Serialized by the single-submitter policy, so no lock is held across
-     the completion wait.  */
-  char *slots;
-  uint64_t slots_phys;
-  int slot_used[VBLK_MAX_REQ];
-  uint16_t *head2slot;
+  /* Request pool: the shared slot-pool engine (one contiguous DMA
+     region of VBLK_MAX_REQ slots plus the head-descriptor-to-slot map
+     completions are validated against, with the stale-completion
+     discard discipline).  The pool has no internal locking, and
+     serve-mode RPCs arrive on concurrent libports worker threads, so
+     req_lock enforces the one-chain-in-flight policy across alloc,
+     post and completion wait (the net driver's tx_lock discipline).  */
+  struct virtio_slot_pool reqs;
+  pthread_mutex_t req_lock;
 
   struct vblk_stats stats;
 };

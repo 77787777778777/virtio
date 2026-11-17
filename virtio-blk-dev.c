@@ -16,8 +16,8 @@
 
 #include "virtio-blk.h"
 
-error_t
-vblk_dev_init (struct vblk_dev *d, const char *override)
+static error_t
+vblk_dev_bring_up (struct vblk_dev *d, const char *override)
 {
   struct virtio_queue *queues[1];
   uint32_t lo, hi;
@@ -107,6 +107,21 @@ vblk_dev_init (struct vblk_dev *d, const char *override)
 
   queues[0] = &d->reqq;
   return virtio_irq_install (&d->irq, &d->pci, queues, 1);
+}
+
+error_t
+vblk_dev_init (struct vblk_dev *d, const char *override)
+{
+  error_t err = vblk_dev_bring_up (d, override);
+
+  if (err)
+    /* Never leave the device configured: a bring-up failure after
+       DRIVER_OK would otherwise leave the queue armed with this (dying)
+       task's DMA memory posted, so the device could keep writing into
+       pages the kernel reclaims at exit.  The status-register reset is
+       the legacy quiescence mechanism; it disarms the queue first.  */
+    virtio_pci_reset (&d->pci);
+  return err;
 }
 
 /* Config-change interrupts re-read the fields the device may change;

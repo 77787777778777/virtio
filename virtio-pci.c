@@ -154,6 +154,7 @@ virtio_pci_probe (struct virtio_pci_dev *v, const char *override)
   err = virtio_pci_enable (v);
   if (err)
     return err;
+  v->probed = 1;
 
   fprintf (stderr,
            "%s: found %04x:%04x at %04x:%02x:%02x.%x, "
@@ -168,6 +169,10 @@ virtio_pci_probe (struct virtio_pci_dev *v, const char *override)
 void
 virtio_pci_reset (struct virtio_pci_dev *v)
 {
+  /* See struct virtio_pci_dev.probed: bring-up failure paths reset a
+     struct whose probe may have failed before any register was valid.  */
+  if (!v->probed)
+    return;
   virtio_pci_outb (v, VIRTIO_PCI_STATUS, 0);
   usleep (10 * 1000);
 }
@@ -203,6 +208,8 @@ virtio_pci_driver_ok (struct virtio_pci_dev *v)
 void
 virtio_pci_quiesce (struct virtio_pci_dev *v)
 {
+  if (!v->probed)
+    return;
   virtio_pci_outb (v, VIRTIO_PCI_STATUS, 0);
   usleep (10 * 1000);
 }

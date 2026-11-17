@@ -240,8 +240,9 @@ virtio_queue_wait_used (struct virtio_queue *q, int timeout_sec,
       if (werr != 0)
         {
           pthread_mutex_unlock (&q->lock);
-          fprintf (stderr, "%s: queue %u: device did not reply\n",
-                   q->pci->name, q->index);
+          /* No log here: a timeout is a normal poll outcome for some
+             callers (the net RX loop wakes every second), and the
+             waiters that treat it as an error log it themselves.  */
           return ETIMEDOUT;
         }
     }

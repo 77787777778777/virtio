@@ -26,8 +26,8 @@ put_pfns (uint32_t *dst, const uint32_t *pfns, uint32_t count)
     virtio_put_le32 (dst + i, pfns[i]);
 }
 
-error_t
-vballoon_dev_init (struct vballoon *b, const char *override)
+static error_t
+vballoon_dev_bring_up (struct vballoon *b, const char *override)
 {
   struct virtio_queue *queues[2];
   uint32_t offered, accepted;
@@ -90,6 +90,19 @@ vballoon_dev_init (struct vballoon *b, const char *override)
   return virtio_irq_install (&b->irq, &b->pci, queues, 2);
 }
 
+error_t
+vballoon_dev_init (struct vballoon *b, const char *override)
+{
+  error_t err = vballoon_dev_bring_up (b, override);
+
+  if (err)
+    /* Same rule as blk/net: a failed bring-up must not leave the device
+       configured; the reset disarms the queues before the PFN arrays
+       (driver DMA memory) go away with the dying task.  */
+    virtio_pci_reset (&b->pci);
+  return err;
+}
+
 uint32_t
 vballoon_dev_read_target (struct vballoon *b)
 {
@@ -137,7 +150,11 @@ vballoon_dev_inflate (struct vballoon *b, uint32_t want, uint32_t *got)
     return err;
   err = virtio_queue_wait_used (&b->ivq, VBALLOON_TIMEOUT, &used);
   if (err)
-    return err;
+    {
+      fprintf (stderr, "virtio-balloon: inflate wait failed: %s\n",
+               strerror (err));
+      return err;
+    }
 
   b->actual += count;
   vballoon_dev_set_actual (b, b->actual);
@@ -181,7 +198,11 @@ vballoon_dev_deflate (struct vballoon *b, uint32_t want, uint32_t *gone)
     return err;
   err = virtio_queue_wait_used (&b->dvq, VBALLOON_TIMEOUT, &used);
   if (err)
-    return err;
+    {
+      fprintf (stderr, "virtio-balloon: deflate wait failed: %s\n",
+               strerror (err));
+      return err;
+    }
 
   vballoon_mem_release_commit (&b->pool);
   b->actual -= count;

@@ -27,75 +27,48 @@
 error_t
 vblk_req_init (struct vblk_dev *d)
 {
-  size_t region = (size_t) VBLK_MAX_REQ * VBLK_SLOT_SIZE;
-  int i;
-
-  if (virtio_dma_alloc (&d->pci, region, (void **) &d->slots,
-                        &d->slots_phys))
-    {
-      fprintf (stderr, "virtio-blk: cannot allocate request pool (%zu)\n",
-               region);
-      return ENOMEM;
-    }
-  memset (d->slots, 0, region);
-  for (i = 0; i < VBLK_MAX_REQ; i++)
-    d->slot_used[i] = 0;
-
-  d->head2slot = malloc ((size_t) d->reqq.num * sizeof (uint16_t));
-  if (!d->head2slot)
-    {
-      vm_deallocate (mach_task_self (), (vm_address_t) d->slots,
-                     (vm_size_t) VBLK_MAX_REQ * VBLK_SLOT_SIZE);
-      d->slots = NULL;
-      return ENOMEM;
-    }
-  for (i = 0; i < d->reqq.num; i++)
-    d->head2slot[i] = VBLK_NO_SLOT;
-  return 0;
+  pthread_mutex_init (&d->req_lock, NULL);
+  return virtio_pool_init (&d->reqs, &d->pci, "virtio-blk", &vblk_verbose,
+                           VBLK_MAX_REQ, VBLK_SLOT_SIZE, d->reqq.num);
 }
 
 void
 vblk_req_release (struct vblk_dev *d)
 {
-  free (d->head2slot);
-  d->head2slot = NULL;
-  if (d->slots)
-    vm_deallocate (mach_task_self (), (vm_address_t) d->slots,
-                   (vm_size_t) VBLK_MAX_REQ * VBLK_SLOT_SIZE);
-  d->slots = NULL;
+  virtio_pool_release (&d->reqs);
+  pthread_mutex_destroy (&d->req_lock);
 }
 
-/* Build, post, and await one chain.  DATA_LEN 0 means the request type
-   carries no data buffer (flush).  DATA is the caller's buffer: for a
-   write it is copied into the slot before posting, for a read it is
-   filled from the slot after the status is validated.  */
+/* Build, post, and await one chain under the dev-level request mutex:
+   serve-mode RPCs arrive on concurrent libports worker threads, and the
+   pool engine has no internal locking, so the one-chain-in-flight
+   policy is enforced here (virtio-blk.h req_lock).  DATA_LEN 0 means
+   the request type carries no data buffer (flush).  DATA is the
+   caller's buffer: for a write it is copied into the slot before
+   posting, for a read it is filled from the slot after the status is
+   validated.  */
 static error_t
-vblk_req_one (struct vblk_dev *d, uint32_t type, uint64_t sector,
-              uint32_t data_len, int data_writable, void *data,
-              struct virtio_used_elem *used)
+vblk_req_one_locked (struct vblk_dev *d, uint32_t type, uint64_t sector,
+                     uint32_t data_len, int data_writable, void *data,
+                     struct virtio_used_elem *used)
 {
   struct virtio_buf bufs[3];
   uint64_t base;
   char *slot;
-  uint16_t head, slot_idx = VBLK_NO_SLOT;
-  int n = 0, i;
+  uint16_t slot_idx;
+  int n = 0;
   error_t err;
   uint8_t status;
 
-  for (i = 0; i < VBLK_MAX_REQ; i++)
-    if (!d->slot_used[i])
-      {
-        slot_idx = i;
-        break;
-      }
-  if (slot_idx == VBLK_NO_SLOT)
+  err = virtio_pool_alloc_slot (&d->reqs, &slot_idx);
+  if (err)
     {
       fprintf (stderr, "virtio-blk: no free request slot\n");
-      return EAGAIN;
+      return err;
     }
 
-  base = d->slots_phys + (uint64_t) slot_idx * VBLK_SLOT_SIZE;
-  slot = d->slots + (size_t) slot_idx * VBLK_SLOT_SIZE;
+  base = virtio_pool_slot_phys (&d->reqs, slot_idx);
+  slot = virtio_pool_slot (&d->reqs, slot_idx);
 
   virtio_put_le32 (slot + 0, type);
   virtio_put_le32 (slot + 4, 0); /* ioprio */
@@ -119,62 +92,35 @@ vblk_req_one (struct vblk_dev *d, uint32_t type, uint64_t sector,
   bufs[n].flags = VIRTQ_DESC_F_WRITE; /* the device writes the status */
   n++;
 
-  /* The head descriptor index is what the device echoes back as the used
-     entry's id, so record the chain's head before posting it.  Only the
-     submitting thread touches free_head, and the MVP is serialized.  */
-  head = d->reqq.free_head;
-  err = virtio_queue_post (&d->reqq, bufs, n);
-  if (err)
-    return err;
-  d->head2slot[head] = slot_idx;
-  d->slot_used[slot_idx] = 1;
-
-  /* A timeout keeps the slot marked: the chain is still device-owned and
-     its buffers must not be handed to another request while the device
-     may still be writing them.  When the entry finally lands, whichever
-     request is waiting next consumes and discards it below; if it never
-     lands, the engine exhausts its slots and fails loudly instead of
+  /* The pool records the chain's head and marks the slot, then waits
+     for this chain's completion, discarding completions of requests
+     that timed out earlier.  A timeout keeps the slot marked: the chain
+     is still device-owned and its buffers must not be handed to another
+     request while the device may still be writing them.  If it never
+     lands, the pool exhausts its slots and fails loudly instead of
      corrupting a live request.  */
-  for (;;)
+  err = virtio_pool_post_wait (&d->reqs, &d->reqq, slot_idx, bufs, n,
+                               VBLK_TIMEOUT, used);
+  if (err)
     {
-      err = virtio_queue_wait_used (&d->reqq, VBLK_TIMEOUT, used);
-      if (err)
-        {
-          d->stats.errors++;
-          return err;
-        }
+      if (err == EIO)
+        d->stats.bad_completions++;
+      else
+        d->stats.errors++;
+      return err;
+    }
 
-      /* Completion validation: id must be a descriptor head of a chain
-         this driver posted, and the used length must be a possible chain
-         length.  */
-      if (used->id >= d->reqq.num || d->head2slot[used->id] == VBLK_NO_SLOT
-          || used->len == 0 || used->len > VBLK_SLOT_SIZE)
-        {
-          fprintf (stderr, "virtio-blk: completion id %u (len %u) is not a "
-                  "posted chain\n", used->id, used->len);
-          d->stats.bad_completions++;
-          return EIO;
-        }
-
-      /* Entry of a request that timed out earlier: drop it and keep
-         waiting for this request's own completion.  */
-      if (d->head2slot[used->id] != slot_idx)
-        {
-          uint16_t stale = d->head2slot[used->id];
-
-          if (vblk_verbose)
-            fprintf (stderr, "virtio-blk: discarding completion of the "
-                    "request that timed out (slot %u)\n", stale);
-          d->head2slot[used->id] = VBLK_NO_SLOT;
-          d->slot_used[stale] = 0;
-          continue;
-        }
-      break;
+  /* The used length must be a possible chain length (device-written
+     status plus at most the data buffer).  */
+  if (used->len == 0 || used->len > VBLK_SLOT_SIZE)
+    {
+      fprintf (stderr, "virtio-blk: completion id %u (len %u) is not a "
+              "posted chain\n", used->id, used->len);
+      d->stats.bad_completions++;
+      return EIO;
     }
 
   status = (uint8_t) slot[VBLK_HDR_SIZE + VBLK_DATA_MAX];
-  d->head2slot[used->id] = VBLK_NO_SLOT;
-  d->slot_used[slot_idx] = 0;
 
   if (status != VBLK_S_OK)
     {
@@ -193,6 +139,20 @@ vblk_req_one (struct vblk_dev *d, uint32_t type, uint64_t sector,
   if (data && data_writable)
     memcpy (data, slot + VBLK_HDR_SIZE, data_len);
   return 0;
+}
+
+static error_t
+vblk_req_one (struct vblk_dev *d, uint32_t type, uint64_t sector,
+              uint32_t data_len, int data_writable, void *data,
+              struct virtio_used_elem *used)
+{
+  error_t err;
+
+  pthread_mutex_lock (&d->req_lock);
+  err = vblk_req_one_locked (d, type, sector, data_len, data_writable,
+                             data, used);
+  pthread_mutex_unlock (&d->req_lock);
+  return err;
 }
 
 /* Chunked read/write: one descriptor chain per chunk, bounded by the

@@ -9,3 +9,8 @@ virtio-9p
 virtio-balloon
 virtio-blk
 vblk-client
+vnetDeviceServer.c
+vnet-device_S.h
+vnetNotifyServer.c
+vnet-notify_S.h
+virtio-net
