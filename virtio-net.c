@@ -229,6 +229,10 @@ selftest_rcv_msg (struct vnet_hurd *h)
       goto out;
     }
 
+  /* Every failed check below leaves through `out'.  The result stays an
+     error until the last of them has passed.  */
+  err = EIO;
+
   selftest_arp_frame (d, frame);
   vnet_hurd_rx_all (d, (const char *) frame, sizeof frame);
 
