@@ -89,6 +89,19 @@ static int do_test(const char *node)
       return 1;
     }
 
+  /* An open that the driver refuses: it releases the port it made for
+     the handle, and the device goes on answering.  */
+  {
+    file_t file = file_name_lookup(node, O_READ | O_WRITE, 0);
+    device_t refused = MACH_PORT_NULL;
+
+    err = device_open(file, 0, "", &refused);
+    record("open without a read or write mode refused", err != 0, NULL);
+    if (!err)
+      device_close(refused);
+    mach_port_deallocate(mach_task_self(), file);
+  }
+
   err = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &rcv);
   if (err)
     {
