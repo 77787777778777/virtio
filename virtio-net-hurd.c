@@ -447,8 +447,15 @@ vnet_hurd_rx_one (struct vnet_hurd *h, const char *frame, size_t frame_len,
         }
       else
         {
-          mach_port_deallocate (mach_task_self (),
-                                m->msg_hdr.msgh_remote_port);
+          /* A send that times out on a full queue hands the message
+             back, and with it one more reference to the destination,
+             which is released here.  A send that the kernel refuses
+             before it takes the message (the destination is a dead
+             name) hands nothing back: the one reference left is the
+             filter's own, and the dead-name handler releases it.  */
+          if ((mr & ~MACH_MSG_MASK) == MACH_SEND_TIMED_OUT)
+            mach_port_deallocate (mach_task_self (),
+                                  m->msg_hdr.msgh_remote_port);
           if (vnet_verbose)
             fprintf (stderr, "virtio-net: NET_RCV_MSG send failed: 0x%x\n",
                      mr);
