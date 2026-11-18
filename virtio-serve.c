@@ -248,7 +248,11 @@ virtio_serve_open_port (const char *name, dev_mode_t mode, error_t *err)
   e = serve_ops->handle_open (p, mode);
   if (e)
     {
+      /* ports_destroy_right gives up the receive right only.  The
+         reference that ports_create_port returned is still ours, and
+         nothing else would drop it.  */
       ports_destroy_right (p);
+      ports_port_deref (p);
       *err = e;
       return NULL;
     }
