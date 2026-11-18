@@ -209,17 +209,10 @@ vnet_dev_tx (struct vnet_dev *d, const void *frame, size_t len)
       return err;
     }
 
-  __atomic_fetch_add (&d->tx_inflight, 1, __ATOMIC_SEQ_CST);
-
-  /* Release the submission lock before waiting for completion so other
-     writers can pipeline their frames.  */
-  pthread_mutex_unlock (&d->tx_lock);
-
-  err = virtio_pool_wait_slot (&d->txpool, &d->txq, slot_idx,
-                               VNET_TX_TIMEOUT, &used);
-  __atomic_fetch_sub (&d->tx_inflight, 1, __ATOMIC_SEQ_CST);
-
-  pthread_mutex_lock (&d->tx_lock);
+  /* EXPERIMENT: the frame is on the queue; the slot is reclaimed by the
+     reap at the start of a later transmit.  */
+  (void) used;
+  err = 0;
   if (err)
     {
       if (err == EIO)
