@@ -156,10 +156,13 @@ ds_device_write (vblk_port_t device, mach_port_t reply_port,
 
   err = vblk_hurd_write (&device->hurd, mode, recnum, data, datalen,
                          bytes_written);
-  /* The write data arrives out of line and is ours to free (the MIG
-     stub moves the pages into this task; see the eth-multiplexer
-     ds_device_write note).  */
-  vm_deallocate (mach_task_self (), (vm_address_t) data, datalen);
+  /* The write data arrives out of line (the MIG stub moves the pages
+     into this task).  After a successful return it is ours to free.
+     After an error the server loop destroys the request and the data
+     with it (glibc's mach_msg_server), so freeing it here as well would
+     unmap whatever another thread mapped at that address in between.  */
+  if (!err)
+    vm_deallocate (mach_task_self (), (vm_address_t) data, datalen);
   return err;
 }
 

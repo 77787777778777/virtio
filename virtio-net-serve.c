@@ -171,10 +171,13 @@ ds_device_write (vnet_port_t device, mach_port_t reply_port,
 
   err = vnet_hurd_write (&device->hurd, mode, recnum, data, datalen,
                          bytes_written);
-  /* The write data arrives out of line and is ours to free (the MIG
-     stub moves the pages into this task; see the eth-multiplexer
-     ds_device_write note).  */
-  vm_deallocate (mach_task_self (), (vm_address_t) data, datalen);
+  /* The write data arrives out of line (the MIG stub moves the pages
+     into this task).  After a successful return it is ours to free.
+     After an error the server loop destroys the request and the data
+     with it (glibc's mach_msg_server), so freeing it here as well would
+     unmap whatever another thread mapped at that address in between.  */
+  if (!err)
+    vm_deallocate (mach_task_self (), (vm_address_t) data, datalen);
   return err;
 }
 
@@ -267,21 +270,18 @@ ds_device_set_filter (vnet_port_t device, mach_port_t receive_port,
   /* The same wiring as eth-multiplexer's ds_device_set_filter: a
      dead-name request on the client's receive port makes the filter
      removal (and the send-right drop inside net_free_dead_infp)
-     automatic when the client closes.  */
+     automatic when the client closes.  A port that cannot take the
+     request gets no filter, since nothing would ever remove it.  */
   err = ports_request_dead_name_notification (device, receive_port, NULL);
   if (err)
-    /* The filter never consumed the received send right, so the
-       failure path must drop it like a rejected filter does.  */
-    mach_port_deallocate (mach_task_self (), receive_port);
+    return err;
 
-  err = vnet_hurd_set_filter (&device->hurd, receive_port, priority,
-                              filter, filterlen);
-  if (err)
-    /* A rejected filter leaves the received send right unconsumed;
-       deallocating it here avoids the leak eth-multiplexer's server
-       has on the same path.  */
-    mach_port_deallocate (mach_task_self (), receive_port);
-  return err;
+  /* On an error return the send right is still in the request, and the
+     server loop destroys the request (glibc's mach_msg_server).  A
+     deallocation here would be a second one; for a port that already
+     has a filter it would take the reference that filter holds.  */
+  return vnet_hurd_set_filter (&device->hurd, receive_port, priority,
+                               filter, filterlen);
 }
 
 kern_return_t
