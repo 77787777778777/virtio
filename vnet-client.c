@@ -46,6 +46,35 @@ static error_t open_device(const char *node, device_t *dev)
   return device_open(file, D_READ | D_WRITE, "", dev);
 }
 
+/* A jump to itself: a filter that never returns. */
+static struct bpf_insn jump_back[] =
+{
+  { NETF_IN | NETF_BPF, 0, 0, 0 },
+  { BPF_JMP | BPF_JA, 0, 0, -1 },
+  { BPF_RET | BPF_K, 0, 0, 0 },
+};
+
+/* The driver must refuse a filter that can loop: it runs the filters of
+   every client on the thread that receives frames. */
+static void check_backward_jump(device_t dev)
+{
+  mach_port_t port;
+  error_t err;
+
+  err = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+  if (err)
+    {
+      record("backward jump: port allocated", 0, mach_error_string(err));
+      return;
+    }
+  err = device_set_filter(dev, port, MACH_MSG_TYPE_MAKE_SEND, 0,
+                          (filter_t *) jump_back,
+                          sizeof(jump_back) / sizeof(filter_t));
+  record("filter with a backward jump refused", err != 0, NULL);
+  /* Removes the filter again if the driver took it. */
+  mach_port_destroy(mach_task_self(), port);
+}
+
 /* pfinet's ether filter (accepts ARP, IPv4, IPv6). */
 static struct bpf_insn accept_all[] =
 {
@@ -108,6 +137,8 @@ static int do_test(const char *node)
       device_close(dev);
       return 1;
     }
+
+  check_backward_jump(dev);
 
   selftest_arp_frame(frame);
   err = device_write(dev, 0, 0, (char *) frame, sizeof frame, &written);
