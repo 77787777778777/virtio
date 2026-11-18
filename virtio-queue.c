@@ -170,8 +170,8 @@ virtio_queue_free_chain (struct virtio_queue *q, uint16_t head)
 }
 
 error_t
-virtio_queue_post (struct virtio_queue *q, const struct virtio_buf *bufs,
-                   uint16_t nbufs)
+virtio_queue_post_head (struct virtio_queue *q, const struct virtio_buf *bufs,
+                        uint16_t nbufs, uint16_t *head_out)
 {
   uint16_t head, prev, i;
 
@@ -216,8 +216,17 @@ virtio_queue_post (struct virtio_queue *q, const struct virtio_buf *bufs,
   (*q->avail_idx)++;
   virtio_wmb ();
   virtio_pci_outw (q->pci, VIRTIO_PCI_QUEUE_NOTIFY, q->index);
+  if (head_out)
+    *head_out = head;
   pthread_mutex_unlock (&q->lock);
   return 0;
+}
+
+error_t
+virtio_queue_post (struct virtio_queue *q, const struct virtio_buf *bufs,
+                   uint16_t nbufs)
+{
+  return virtio_queue_post_head (q, bufs, nbufs, NULL);
 }
 
 error_t
@@ -250,12 +259,38 @@ virtio_queue_wait_used (struct virtio_queue *q, int timeout_sec,
   *elem = q->used_ring[q->last_used % q->num];
   if (elem->id >= q->num)
     {
-      pthread_mutex_unlock (&q->lock);
       fprintf (stderr, "%s: queue %u: used entry id %u out of range\n",
                q->pci->name, q->index, elem->id);
+      q->last_used++;
+      pthread_mutex_unlock (&q->lock);
       return EIO;
     }
   virtio_queue_free_chain (q, elem->id);
+  q->last_used++;
+  pthread_mutex_unlock (&q->lock);
+  return 0;
+}
+
+error_t
+virtio_queue_try_pop_used (struct virtio_queue *q, struct virtio_used_elem *out)
+{
+  pthread_mutex_lock (&q->lock);
+  if (virtio_idx_acquire (q->used_idx) == q->last_used)
+    {
+      pthread_mutex_unlock (&q->lock);
+      return EAGAIN;
+    }
+
+  *out = q->used_ring[q->last_used % q->num];
+  if (out->id >= q->num)
+    {
+      fprintf (stderr, "%s: queue %u: used entry id %u out of range\n",
+               q->pci->name, q->index, out->id);
+      q->last_used++;
+      pthread_mutex_unlock (&q->lock);
+      return EIO;
+    }
+  virtio_queue_free_chain (q, out->id);
   q->last_used++;
   pthread_mutex_unlock (&q->lock);
   return 0;
@@ -280,8 +315,19 @@ virtio_irq_handler (void *ctx)
   for (k = 0; k < irq->nqueues; k++)
     {
       struct virtio_queue *q = irq->queues[k];
+      int signal = 0;
+
       pthread_mutex_lock (&q->lock);
-      pthread_cond_broadcast (&q->cv);
+      /* Narrow wakeups to queues that actually have a pending used
+         completion; a spurious wakeup with nothing new just loops in the
+         waiter.  Config-change interrupts do not complete queues, but
+         broadcast anyway for safety/compatibility.  */
+      if (isr & VIRTIO_PCI_ISR_CONFIG)
+        signal = 1;
+      else if (isr & VIRTIO_PCI_ISR_USED)
+        signal = virtio_idx_acquire (q->used_idx) != q->last_used;
+      if (signal)
+        pthread_cond_broadcast (&q->cv);
       pthread_mutex_unlock (&q->lock);
     }
 

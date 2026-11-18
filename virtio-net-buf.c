@@ -81,6 +81,7 @@ vnet_buf_init (struct vnet_dev *d)
     }
   for (i = 0; i < d->rxq.num; i++)
     d->rx_desc2slot[i] = VNET_NO_SLOT;
+  d->rx_nretired = 0;
   pthread_mutex_init (&d->tx_lock, NULL);
 
   /* Prefill the receive queue: every slot becomes one writable
@@ -132,7 +133,7 @@ static void
 vnet_rx_one (struct vnet_dev *d, struct virtio_used_elem *used)
 {
   struct virtio_buf buf;
-  uint16_t head, slot;
+  uint16_t slot;
 
   if (used->id >= d->rxq.num
       || d->rx_desc2slot[used->id] == VNET_NO_SLOT)
@@ -179,20 +180,73 @@ vnet_rx_one (struct vnet_dev *d, struct virtio_used_elem *used)
   }
 
  repost:
-  head = d->rxq.free_head;
-  buf.addr = d->rx_bufs_phys + (uint64_t) slot * d->rx_buf_size;
-  buf.len = d->rx_buf_size;
-  buf.flags = VIRTQ_DESC_F_WRITE;
-  if (virtio_queue_post (&d->rxq, &buf, 1))
+  {
+    int retries;
+    uint16_t post_head = d->rxq.free_head;
+
+    buf.addr = d->rx_bufs_phys + (uint64_t) slot * d->rx_buf_size;
+    buf.len = d->rx_buf_size;
+    buf.flags = VIRTQ_DESC_F_WRITE;
+    for (retries = 0; retries < VNET_RX_REPLENISH_RETRIES; retries++)
+      {
+        post_head = d->rxq.free_head;
+        if (virtio_queue_post_head (&d->rxq, &buf, 1, &post_head) == 0)
+          break;
+      }
+    if (retries >= VNET_RX_REPLENISH_RETRIES)
+      {
+        /* Persistent replenish failure: record the slot for recovery and
+           continue with reduced RX capacity until it can be reposted.  */
+        fprintf (stderr, "virtio-net: RX replenish of slot %u failed "
+                 "after %d retries; deferring slot\n", slot, retries);
+        d->stats.rx_bad++;
+        if (d->rx_nretired < VNET_RX_SLOTS)
+          {
+            uint16_t k;
+            int dup = 0;
+            for (k = 0; k < d->rx_nretired; k++)
+              if (d->rx_retired[k] == slot)
+                { dup = 1; break; }
+            if (!dup)
+              d->rx_retired[d->rx_nretired++] = slot;
+          }
+        return;
+      }
+    d->rx_desc2slot[post_head] = slot;
+  }
+}
+
+/* Try to repost any RX slots that failed replenishment earlier.  */
+static void
+vnet_rx_recover_retired (struct vnet_dev *d)
+{
+  uint16_t i, j = 0;
+
+  for (i = 0; i < d->rx_nretired; i++)
     {
-      /* The ring is full of outstanding buffers, which cannot happen
-         when every completion is followed by exactly one repost; treat
-         it as a bug and stop counting on this slot.  */
-      fprintf (stderr, "virtio-net: RX replenish of slot %u failed\n", slot);
-      d->stats.rx_bad++;
-      return;
+      uint16_t slot = d->rx_retired[i];
+      struct virtio_buf buf;
+      uint16_t post_head;
+      int retries, ok = 0;
+
+      buf.addr = d->rx_bufs_phys + (uint64_t) slot * d->rx_buf_size;
+      buf.len = d->rx_buf_size;
+      buf.flags = VIRTQ_DESC_F_WRITE;
+      for (retries = 0; retries < VNET_RX_REPLENISH_RETRIES; retries++)
+        {
+          post_head = d->rxq.free_head;
+          if (virtio_queue_post_head (&d->rxq, &buf, 1, &post_head) == 0)
+            {
+              ok = 1;
+              break;
+            }
+        }
+      if (ok)
+        d->rx_desc2slot[post_head] = slot;
+      else
+        d->rx_retired[j++] = slot;
     }
-  d->rx_desc2slot[head] = slot;
+  d->rx_nretired = j;
 }
 
 /* RX service loop: wait for completions, deliver, replenish.  Runs on its
@@ -208,6 +262,7 @@ vnet_buf_rx_loop (struct vnet_dev *d)
      or the daemon stop path) while this loop runs.  */
   while (!__atomic_load_n (&d->stopping, __ATOMIC_SEQ_CST))
     {
+      vnet_rx_recover_retired (d);
       err = virtio_queue_wait_used (&d->rxq, 1, &used);
       if (err == ETIMEDOUT)
         continue;
@@ -215,9 +270,30 @@ vnet_buf_rx_loop (struct vnet_dev *d)
         {
           fprintf (stderr, "virtio-net: RX wait failed: %s\n",
                    strerror (err));
-          d->stats.rx_bad++;
+          d->stats.bad_completions++;
           continue;
         }
       vnet_rx_one (d, &used);
+      /* Batch-drain any additional completions already available.  */
+      for (;;)
+        {
+          err = virtio_queue_try_pop_used (&d->rxq, &used);
+          if (err == EAGAIN)
+            break;
+          if (err)
+            {
+              if (err == EIO)
+                d->stats.bad_completions++;
+              else
+                {
+                  fprintf (stderr, "virtio-net: RX pop failed: %s\n",
+                           strerror (err));
+                  d->stats.rx_bad++;
+                }
+              break;
+            }
+          vnet_rx_one (d, &used);
+        }
+      vnet_rx_recover_retired (d);
     }
 }

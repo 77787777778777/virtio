@@ -24,6 +24,9 @@ virtio_pool_init (struct virtio_slot_pool *p,
   p->name = name;
   p->verbose = verbose;
   p->slot_size = slot_size;
+
+  pthread_mutex_init (&p->lock, NULL);
+  pthread_cond_init (&p->cv, NULL);
   /* Clamp the pool to the device-reported queue depth: a pool larger
      than a queue would strand slots that can never be posted.  */
   p->nslots = queue_num < max_slots ? queue_num : max_slots;
@@ -40,7 +43,12 @@ virtio_pool_init (struct virtio_slot_pool *p,
 
   p->head2slot = malloc ((size_t) queue_num * sizeof (uint16_t));
   p->slot_used = malloc ((size_t) p->nslots * sizeof (int));
-  if (!p->head2slot || !p->slot_used)
+  p->slot_done = malloc ((size_t) p->nslots * sizeof (int));
+  p->slot_result = malloc ((size_t) p->nslots * sizeof (struct virtio_used_elem));
+  p->slot_error = malloc ((size_t) p->nslots * sizeof (int));
+  p->slot_waiters = malloc ((size_t) p->nslots * sizeof (int));
+  if (!p->head2slot || !p->slot_used || !p->slot_done
+      || !p->slot_result || !p->slot_error || !p->slot_waiters)
     {
       virtio_pool_release (p);
       return ENOMEM;
@@ -48,7 +56,13 @@ virtio_pool_init (struct virtio_slot_pool *p,
   for (i = 0; i < queue_num; i++)
     p->head2slot[i] = VIRTIO_POOL_NO_SLOT;
   for (i = 0; i < p->nslots; i++)
-    p->slot_used[i] = 0;
+    {
+      p->slot_used[i] = 0;
+      p->slot_done[i] = 0;
+      p->slot_error[i] = 0;
+      p->slot_waiters[i] = 0;
+    }
+  p->pool_error_seq = 0;
   return 0;
 }
 
@@ -59,6 +73,16 @@ virtio_pool_release (struct virtio_slot_pool *p)
   p->head2slot = NULL;
   free (p->slot_used);
   p->slot_used = NULL;
+  free (p->slot_done);
+  p->slot_done = NULL;
+  free (p->slot_result);
+  p->slot_result = NULL;
+  free (p->slot_error);
+  p->slot_error = NULL;
+  free (p->slot_waiters);
+  p->slot_waiters = NULL;
+  pthread_cond_destroy (&p->cv);
+  pthread_mutex_destroy (&p->lock);
   if (p->slots)
     {
       vm_deallocate (mach_task_self (), (vm_address_t) p->slots,
@@ -71,14 +95,18 @@ error_t
 virtio_pool_alloc_slot (struct virtio_slot_pool *p, uint16_t *slot)
 {
   uint16_t i;
+  error_t err = EAGAIN;
 
+  pthread_mutex_lock (&p->lock);
   for (i = 0; i < p->nslots; i++)
-    if (!p->slot_used[i])
+    if (!p->slot_used[i] && !p->slot_done[i])
       {
         *slot = i;
-        return 0;
+        err = 0;
+        break;
       }
-  return EAGAIN;
+  pthread_mutex_unlock (&p->lock);
+  return err;
 }
 
 error_t
@@ -88,59 +116,175 @@ virtio_pool_post_wait (struct virtio_slot_pool *p,
                        uint16_t nbufs, int timeout_sec,
                        struct virtio_used_elem *used)
 {
+  error_t err;
+
+  err = virtio_pool_submit (p, q, slot, bufs, nbufs, NULL);
+  if (err)
+    return err;
+  return virtio_pool_wait_slot (p, q, slot, timeout_sec, used);
+}
+
+error_t
+virtio_pool_submit (struct virtio_slot_pool *p, struct virtio_queue *q,
+                    uint16_t slot, const struct virtio_buf *bufs,
+                    uint16_t nbufs, uint16_t *head_out)
+{
   uint16_t head;
   error_t err;
 
-  /* The head descriptor index is what the device echoes back as the used
-     entry's id, so record the chain's head before posting it.  */
-  head = q->free_head;
-  err = virtio_queue_post (q, bufs, nbufs);
+  err = virtio_queue_post_head (q, bufs, nbufs, &head);
   if (err)
     return err;
+
+  pthread_mutex_lock (&p->lock);
   p->head2slot[head] = slot;
   p->slot_used[slot] = 1;
+  p->slot_done[slot] = 0;
+  p->slot_error[slot] = 0;
+  pthread_mutex_unlock (&p->lock);
+
+  if (head_out)
+    *head_out = head;
+  return 0;
+}
+
+static int
+virtio_pool_reap_locked_impl (struct virtio_slot_pool *p,
+                              struct virtio_queue *q)
+{
+  int count = 0;
 
   for (;;)
     {
-      err = virtio_queue_wait_used (q, timeout_sec, used);
-      if (err)
-        {
-          /* The chain is still device-owned; leave the slot marked so a
-             reused buffer cannot race the device.  When the entry
-             finally lands, whichever request is waiting next consumes
-             and discards it below; if it never lands, the pool exhausts
-             its slots and fails loudly instead of corrupting a live
-             request.  */
-          fprintf (stderr, "%s: completion wait failed: %s\n", p->name,
-                   strerror (err));
-          return err;
-        }
+      struct virtio_used_elem used;
+      error_t err = virtio_queue_try_pop_used (q, &used);
 
-      /* Completion validation: the id must name a descriptor head of a
-         chain this driver posted.  */
-      if (p->head2slot[used->id] == VIRTIO_POOL_NO_SLOT)
+      if (err == EAGAIN)
+        break;
+      if (err == EIO)
         {
-          fprintf (stderr, "%s: completion id %u (len %u) is not a "
-                   "posted chain\n", p->name, used->id, used->len);
-          return EIO;
-        }
-      /* Entry of a chain that timed out earlier: drop it and keep
-         waiting for this request's own completion.  */
-      if (p->head2slot[used->id] != slot)
-        {
-          uint16_t stale = p->head2slot[used->id];
-
-          if (p->verbose && *p->verbose)
-            fprintf (stderr, "%s: discarding completion of the "
-                     "timed-out request (slot %u)\n", p->name, stale);
-          p->head2slot[used->id] = VIRTIO_POOL_NO_SLOT;
-          p->slot_used[stale] = 0;
+          fprintf (stderr, "%s: bad used id (K1)\n", p->name);
+          p->pool_error_seq++;
+          pthread_mutex_lock (&q->lock);
+          pthread_cond_broadcast (&q->cv);
+          pthread_mutex_unlock (&q->lock);
           continue;
         }
-      break;
-    }
+      if (err)
+        return -1;
 
-  p->head2slot[used->id] = VIRTIO_POOL_NO_SLOT;
-  p->slot_used[slot] = 0;
-  return 0;
+      count++;
+      if (used.id >= q->num || p->head2slot[used.id] == VIRTIO_POOL_NO_SLOT)
+        {
+          fprintf (stderr, "%s: completion id %u (len %u) is not a "
+                   "posted chain\n", p->name, used.id, used.len);
+          p->pool_error_seq++;
+          pthread_mutex_lock (&q->lock);
+          pthread_cond_broadcast (&q->cv);
+          pthread_mutex_unlock (&q->lock);
+          continue;
+        }
+      {
+        uint16_t slot = p->head2slot[used.id];
+
+        p->head2slot[used.id] = VIRTIO_POOL_NO_SLOT;
+        p->slot_used[slot] = 0;
+        if (p->slot_waiters[slot] > 0)
+          {
+            p->slot_result[slot] = used;
+            p->slot_error[slot] = 0;
+            p->slot_done[slot] = 1;
+            pthread_cond_broadcast (&p->cv);
+          }
+        else
+          {
+            p->slot_done[slot] = 0;
+          }
+      }
+    }
+  return count;
+}
+
+int
+virtio_pool_reap_locked (struct virtio_slot_pool *p, struct virtio_queue *q)
+{
+  return virtio_pool_reap_locked_impl (p, q);
+}
+
+int
+virtio_pool_reap (struct virtio_slot_pool *p, struct virtio_queue *q)
+{
+  int r;
+
+  pthread_mutex_lock (&p->lock);
+  r = virtio_pool_reap_locked_impl (p, q);
+  pthread_mutex_unlock (&p->lock);
+  return r;
+}
+
+error_t
+virtio_pool_wait_slot (struct virtio_slot_pool *p, struct virtio_queue *q,
+                       uint16_t slot, int timeout_sec,
+                       struct virtio_used_elem *used)
+{
+  struct timespec deadline;
+  int werr;
+  uint32_t observed_seq;
+
+  clock_gettime (CLOCK_REALTIME, &deadline);
+  deadline.tv_sec += timeout_sec;
+
+  pthread_mutex_lock (&p->lock);
+  p->slot_waiters[slot]++;
+  observed_seq = p->pool_error_seq;
+  pthread_mutex_unlock (&p->lock);
+
+  for (;;)
+    {
+      pthread_mutex_lock (&p->lock);
+      virtio_pool_reap_locked_impl (p, q);
+      if (p->slot_done[slot])
+        {
+          *used = p->slot_result[slot];
+          p->slot_done[slot] = 0;
+          werr = p->slot_error[slot];
+          p->slot_waiters[slot]--;
+          pthread_mutex_unlock (&p->lock);
+          return werr;
+        }
+      if (p->pool_error_seq != observed_seq)
+        {
+          p->slot_waiters[slot]--;
+          pthread_mutex_unlock (&p->lock);
+          return EIO;
+        }
+      pthread_mutex_unlock (&p->lock);
+
+      pthread_mutex_lock (&q->lock);
+      werr = pthread_cond_timedwait (&q->cv, &q->lock, &deadline);
+      pthread_mutex_unlock (&q->lock);
+      if (werr != 0)
+        {
+          pthread_mutex_lock (&p->lock);
+          virtio_pool_reap_locked_impl (p, q);
+          if (p->slot_done[slot])
+            {
+              *used = p->slot_result[slot];
+              p->slot_done[slot] = 0;
+              werr = p->slot_error[slot];
+              p->slot_waiters[slot]--;
+              pthread_mutex_unlock (&p->lock);
+              return werr;
+            }
+          if (p->pool_error_seq != observed_seq)
+            {
+              p->slot_waiters[slot]--;
+              pthread_mutex_unlock (&p->lock);
+              return EIO;
+            }
+          p->slot_waiters[slot]--;
+          pthread_mutex_unlock (&p->lock);
+          return ETIMEDOUT;
+        }
+    }
 }

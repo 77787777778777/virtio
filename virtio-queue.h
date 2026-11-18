@@ -89,12 +89,23 @@ error_t virtio_queue_setup (struct virtio_pci_dev *, struct virtio_queue *,
    descriptor is the head; the core links the chain with F_NEXT.  */
 error_t virtio_queue_post (struct virtio_queue *, const struct virtio_buf *,
                            uint16_t nbufs);
+/* Like virtio_queue_post, but also returns the posted chain's head
+   descriptor index through *HEAD_OUT (may be NULL).  */
+error_t virtio_queue_post_head (struct virtio_queue *, const struct virtio_buf *,
+                                uint16_t nbufs, uint16_t *head_out);
 
 /* Wait for one used entry and return it; the completed descriptor chain is
    recycled.  TIMEOUT_SEC bounds the interrupt wait (the fallback for a lost
    interrupt, not the normal completion path).  */
 error_t virtio_queue_wait_used (struct virtio_queue *, int timeout_sec,
                                 struct virtio_used_elem *);
+/* Nonblocking, K1-safe pop of one completed used entry.  Returns 0 with
+   *OUT filled when a completion is available, EAGAIN when none is, and
+   EIO for an invalid used id (after advancing last_used, without
+   recycling descriptors).  */
+error_t virtio_queue_try_pop_used (struct virtio_queue *,
+                                   struct virtio_used_elem *);
+
 
 /* Install/remove the INTx handler (libirqhelp).  Removal resets the device
    first (stopping new INTx asserts and clearing the ISR), then drops the

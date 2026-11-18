@@ -348,7 +348,9 @@ vnet_build_rcv_msg (struct net_rcv_msg *msg, const char *frame,
   struct packet_header *packet;
   size_t pack_size = frame_len - VNET_ETHER_HDR_SIZE;
 
-  memset (msg, 0, sizeof *msg);
+  msg->msg_hdr.msgh_bits = 0;
+  msg->msg_hdr.msgh_remote_port = MACH_PORT_NULL;
+  msg->msg_hdr.msgh_seqno = 0;
   msg->msg_hdr.msgh_size = sizeof (struct net_rcv_msg) - NET_RCV_MAX
                            + pack_size;
   msg->msg_hdr.msgh_size = (mach_msg_size_t)
@@ -367,6 +369,7 @@ vnet_build_rcv_msg (struct net_rcv_msg *msg, const char *frame,
   packet->length = pack_size + sizeof (struct packet_header);
   msg->packet_type.msgt_number = packet->length;
   msg->net_rcv_msg_packet_count = packet->length;
+  msg->sent = 0;
 }
 
 /* Deliver to one open handle: evaluate every registered filter and send
@@ -377,16 +380,21 @@ vnet_build_rcv_msg (struct net_rcv_msg *msg, const char *frame,
    send counts accumulate into the caller's tallies.  */
 static void
 vnet_hurd_rx_one (struct vnet_hurd *h, const char *frame, size_t frame_len,
+                  struct net_rcv_msg *template, int *template_built,
                   int *delivered, int *failed)
 {
-  struct net_rcv_msg msg;
+  struct net_rcv_msg local_msg;
+  struct net_rcv_msg *m = NULL;
   queue_head_t *if_port_list;
   net_rcv_port_t infp, nextfp;
+  size_t pack_size = frame_len - VNET_ETHER_HDR_SIZE;
+  mach_msg_size_t packet_count = (mach_msg_size_t)
+    (pack_size + sizeof (struct packet_header));
 
   if (!h->opened)
     return;
-
-  vnet_build_rcv_msg (&msg, frame, frame_len);
+  if (queue_empty (&h->filters.if_rcv_port_list))
+    return;
 
   if_port_list = &h->filters.if_rcv_port_list;
   pthread_mutex_lock (&h->lock);
@@ -398,19 +406,39 @@ vnet_hurd_rx_one (struct vnet_hurd *h, const char *frame, size_t frame_len,
       mach_msg_return_t mr;
 
       entp = (net_hash_entry_t) 0;
+      /* Evaluate the filter against the frame views first, so the (costly)
+         per-frame NET_RCV_MSG is built only when a filter actually accepts.  */
       ret_count = bpf_do_filter (infp,
-                                 msg.packet + sizeof (struct packet_header),
-                                 msg.net_rcv_msg_packet_count, msg.header,
-                                 VNET_ETHER_HDR_SIZE, &hash_headp, &entp);
+                                 (char *) frame + VNET_ETHER_HDR_SIZE,
+                                 packet_count,
+                                 (char *) frame, VNET_ETHER_HDR_SIZE,
+                                 &hash_headp, &entp);
       if (!ret_count)
         continue;
 
+      if (!m)
+        {
+          if (template && template_built && *template_built)
+            m = template;
+          else if (template && template_built)
+            {
+              vnet_build_rcv_msg (template, frame, frame_len);
+              *template_built = 1;
+              m = template;
+            }
+          else
+            {
+              vnet_build_rcv_msg (&local_msg, frame, frame_len);
+              m = &local_msg;
+            }
+        }
+
       dest = entp ? entp->rcv_port : infp->rcv_port;
-      msg.msg_hdr.msgh_bits = MACH_MSGH_BITS (MACH_MSG_TYPE_COPY_SEND, 0);
-      msg.msg_hdr.msgh_remote_port = dest;
-      mr = mach_msg ((mach_msg_header_t *) &msg,
+      m->msg_hdr.msgh_bits = MACH_MSGH_BITS (MACH_MSG_TYPE_COPY_SEND, 0);
+      m->msg_hdr.msgh_remote_port = dest;
+      mr = mach_msg ((mach_msg_header_t *) m,
                      MACH_SEND_MSG | MACH_SEND_TIMEOUT,
-                     msg.msg_hdr.msgh_size, 0, MACH_PORT_NULL, 0,
+                     m->msg_hdr.msgh_size, 0, MACH_PORT_NULL, 0,
                      MACH_PORT_NULL);
       if (mr == MACH_MSG_SUCCESS)
         {
@@ -420,13 +448,15 @@ vnet_hurd_rx_one (struct vnet_hurd *h, const char *frame, size_t frame_len,
       else
         {
           mach_port_deallocate (mach_task_self (),
-                                msg.msg_hdr.msgh_remote_port);
+                                m->msg_hdr.msgh_remote_port);
           if (vnet_verbose)
             fprintf (stderr, "virtio-net: NET_RCV_MSG send failed: 0x%x\n",
                      mr);
           h->dev->stats.rx_delivery_fail++;
           (*failed)++;
         }
+      m->msg_hdr.msgh_bits = 0;
+      m->msg_hdr.msgh_remote_port = MACH_PORT_NULL;
     }
   FILTER_ITERATE_END
   pthread_mutex_unlock (&h->lock);
@@ -438,11 +468,14 @@ vnet_hurd_rx_all (struct vnet_dev *dev, const char *frame, size_t frame_len)
   struct vnet_hurd *h;
   int delivered = 0;
   int failed = 0;
+  struct net_rcv_msg template;
+  int template_built = 0;
 
   pthread_mutex_lock (&vnet_handles_lock);
   for (h = vnet_handles; h; h = h->next)
     if (h->dev == dev)
-      vnet_hurd_rx_one (h, frame, frame_len, &delivered, &failed);
+      vnet_hurd_rx_one (h, frame, frame_len, &template, &template_built,
+                        &delivered, &failed);
   pthread_mutex_unlock (&vnet_handles_lock);
 
   /* One line per received frame, so verbose logs pair every TX

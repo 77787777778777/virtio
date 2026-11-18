@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "virtio-net.h"
 
@@ -171,27 +172,54 @@ vnet_dev_tx (struct vnet_dev *d, const void *frame, size_t len)
   uint16_t slot_idx;
   error_t err;
 
+  if (__atomic_load_n (&d->stopping, __ATOMIC_SEQ_CST))
+    return EIO;
+
   pthread_mutex_lock (&d->tx_lock);
 
+  virtio_pool_reap (&d->txpool, &d->txq);
   err = virtio_pool_alloc_slot (&d->txpool, &slot_idx);
   if (err)
     {
-      /* Only reachable after prior timeouts left every slot marked.  */
-      fprintf (stderr, "virtio-net: no free TX slot\n");
-      pthread_mutex_unlock (&d->tx_lock);
-      return EAGAIN;
+      /* Reap any completions that landed since the last submission
+         before declaring exhaustion.  */
+      virtio_pool_reap (&d->txpool, &d->txq);
+      err = virtio_pool_alloc_slot (&d->txpool, &slot_idx);
+      if (err)
+        {
+          /* Only reachable after prior timeouts left every slot marked.  */
+          fprintf (stderr, "virtio-net: no free TX slot\n");
+          pthread_mutex_unlock (&d->tx_lock);
+          return EAGAIN;
+        }
     }
 
   slot = virtio_pool_slot (&d->txpool, slot_idx);
-  vnet_hdr_zero (slot);
   memcpy (slot + VNET_HDR_SIZE, frame, len);
 
   buf.addr = virtio_pool_slot_phys (&d->txpool, slot_idx);
   buf.len = VNET_HDR_SIZE + len;
   buf.flags = 0;  /* the device reads header and frame */
 
-  err = virtio_pool_post_wait (&d->txpool, &d->txq, slot_idx, &buf, 1,
+  err = virtio_pool_submit (&d->txpool, &d->txq, slot_idx, &buf, 1, NULL);
+  if (err)
+    {
+      /* Submission failed; slot was never marked in flight.  */
+      pthread_mutex_unlock (&d->tx_lock);
+      return err;
+    }
+
+  __atomic_fetch_add (&d->tx_inflight, 1, __ATOMIC_SEQ_CST);
+
+  /* Release the submission lock before waiting for completion so other
+     writers can pipeline their frames.  */
+  pthread_mutex_unlock (&d->tx_lock);
+
+  err = virtio_pool_wait_slot (&d->txpool, &d->txq, slot_idx,
                                VNET_TX_TIMEOUT, &used);
+  __atomic_fetch_sub (&d->tx_inflight, 1, __ATOMIC_SEQ_CST);
+
+  pthread_mutex_lock (&d->tx_lock);
   if (err)
     {
       if (err == EIO)
@@ -207,7 +235,6 @@ vnet_dev_tx (struct vnet_dev *d, const void *frame, size_t len)
   if (vnet_verbose)
     fprintf (stderr, "virtio-net: TX %zu bytes ok (slot %u)\n", len,
              slot_idx);
-
   pthread_mutex_unlock (&d->tx_lock);
   return 0;
 }
@@ -215,10 +242,20 @@ vnet_dev_tx (struct vnet_dev *d, const void *frame, size_t len)
 void
 vnet_dev_quiesce (struct vnet_dev *d)
 {
+  int i;
+
   /* Atomic: written here (libports thread) and in the daemon stop path
      while the RX loop reads it concurrently; a torn or cached value
      would strand the join below.  */
   __atomic_store_n (&d->stopping, 1, __ATOMIC_SEQ_CST);
+  /* Wake any TX waiters so they observe stopping and time out promptly.  */
+  pthread_mutex_lock (&d->txq.lock);
+  pthread_cond_broadcast (&d->txq.cv);
+  pthread_mutex_unlock (&d->txq.lock);
+  /* Wait for in-flight TX requests to finish (or time out) before freeing
+     DMA pools.  */
+  for (i = 0; i < 20 && __atomic_load_n (&d->tx_inflight, __ATOMIC_SEQ_CST) > 0; i++)
+    usleep (100000);
   /* Join the RX service thread before freeing the DMA pools: a completion
      handler mid-vnet_rx_one touches rx_bufs, so freeing underneath it is
      a use-after-free.  The serve path (trivfs_goaway) never joins the

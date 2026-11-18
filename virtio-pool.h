@@ -32,6 +32,13 @@ struct virtio_slot_pool
   uint16_t nslots;          /* usable slots, clamped to the queue num */
   int *slot_used;
   uint16_t *head2slot;      /* indexed by descriptor head (q->num) */
+  int *slot_done;
+  struct virtio_used_elem *slot_result;
+  int *slot_error;
+  int *slot_waiters;
+  uint32_t pool_error_seq;
+  pthread_mutex_t lock;
+  pthread_cond_t cv;
   const char *name;         /* driver name for diagnostics */
   const int *verbose;       /* driver's verbose flag */
 };
@@ -68,5 +75,25 @@ error_t virtio_pool_post_wait (struct virtio_slot_pool *p,
                                const struct virtio_buf *bufs,
                                uint16_t nbufs, int timeout_sec,
                                struct virtio_used_elem *used);
+
+/* Submit a slot without waiting for completion.  Caller must coordinate
+   serialization (e.g. hold the driver submission lock).  Records the
+   completion state under the pool lock.  Returns 0 on success.  */
+error_t virtio_pool_submit (struct virtio_slot_pool *p,
+                            struct virtio_queue *q, uint16_t slot,
+                            const struct virtio_buf *bufs, uint16_t nbufs,
+                            uint16_t *head_out);
+
+/* Reap all currently available completed entries into per-slot completion
+   state.  Assumes the caller holds p->lock for the _locked variant.  */
+int virtio_pool_reap (struct virtio_slot_pool *p, struct virtio_queue *q);
+int virtio_pool_reap_locked (struct virtio_slot_pool *p,
+                             struct virtio_queue *q);
+
+/* Wait for SLOT's completion (opportunistic reap).  Returns 0 on success
+   and fills *USED; ETIMEDOUT on timeout (slot stays in flight).  */
+error_t virtio_pool_wait_slot (struct virtio_slot_pool *p,
+                               struct virtio_queue *q, uint16_t slot,
+                               int timeout_sec, struct virtio_used_elem *used);
 
 #endif /* VIRTIO_POOL_H */

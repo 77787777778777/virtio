@@ -96,8 +96,8 @@
    shrinks them below what the backend may deliver), clamped to
    VNET_RX_BUF_MAX; TX slots carry `hdr + frame`.  The counts are clamped
    to the device-reported queue size at init.  */
-#define VNET_RX_SLOTS 64
-#define VNET_TX_SLOTS 64
+#define VNET_RX_SLOTS 1024
+#define VNET_TX_SLOTS 1024
 #define VNET_RX_BUF_MAX 2048
 
 /* Sentinel for "no slot"; valid slots are below the clamped counts.  */
@@ -112,6 +112,9 @@
    stalled backend must not block a D_NOWAIT write for thirty seconds.
    One second is the lost-interrupt fallback for TX.  */
 #define VNET_TX_TIMEOUT 1
+
+/* Bounded retries for RX replenish after a slot detach (K3).  */
+#define VNET_RX_REPLENISH_RETRIES 3
 
 /* How long --selftest-traffic waits for a backend reply (seconds).  */
 #define VNET_SELFTEST_RX_WAIT 5
@@ -152,6 +155,10 @@ struct vnet_dev {
   uint16_t rx_nslots;
   uint16_t *rx_desc2slot;
 
+  /* Retired RX slots (replenish failed) awaiting recovery.  */
+  uint16_t rx_retired[VNET_RX_SLOTS];
+  uint16_t rx_nretired;
+
   /* TX pool: the shared slot-pool engine (one contiguous DMA region, one
      device-readable buffer per slot, head2slot completion mapping with
      the stale-discard wait discipline).  Serialized by tx_lock: one
@@ -166,6 +173,7 @@ struct vnet_dev {
   pthread_t rx_thread;
   int rx_created;
   int stopping;  /* set at teardown; wakes the RX thread's timeout loop */
+  int tx_inflight; /* number of TX requests currently in flight */
 
   struct vnet_stats stats;
 };
