@@ -8,7 +8,8 @@
 CC ?= cc
 CFLAGS ?= -O2 -g -Wall
 
-all: virtio-9p virtio-balloon virtio-blk vblk-client virtio-net vnet-client
+all: virtio-9p virtio-balloon virtio-blk vblk-client virtio-net vnet-client \
+     vnet-bench
 
 # The transport core is shared by all drivers; the 9p translator adds the
 # trivfs/ports stack, the daemons link lean.
@@ -82,6 +83,10 @@ vblk-client: vblk-client.o
 LIBS_VNET_CLIENT = hurduser machuser
 
 vnet-client: vnet-client.o
+	$(CC) $(CFLAGS) $^ -o $@ $(foreach LIB,$(LIBS_VNET_CLIENT),-l$(LIB))
+
+# vnet-bench times device_write on any Mach network device.
+vnet-bench: vnet-bench.o
 	$(CC) $(CFLAGS) $^ -o $@ $(foreach LIB,$(LIBS_VNET_CLIENT),-l$(LIB))
 
 # device.defs (subsystem 2800) carries device_open_new only under
@@ -168,7 +173,7 @@ virtio-serve.o: virtio-serve.h
 clean:
 	rm -f $(OBJS9P) $(OBJSBAL) $(OBJSBLK) $(OBJSNET) virtio-pool.o virtio-9p \
 	    virtio-balloon virtio-blk vblk-client vblk-client.o virtio-net \
-	    vnet-client vnet-client.o \
+	    vnet-client vnet-client.o vnet-bench vnet-bench.o \
 	    device.sdefsi* deviceServer.c device_S.h notify.sdefsi* \
 	    notifyServer.c notify_S.h vnet-device.sdefsi* vnetDeviceServer.c \
 	    vnet-device_S.h vnet-notify.sdefsi* vnetNotifyServer.c \
