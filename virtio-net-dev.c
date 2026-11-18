@@ -220,6 +220,11 @@ vnet_tx_submit (struct vnet_dev *d, const void *frame, size_t len,
     }
 
   slot = virtio_pool_slot (&d->txpool, *slot_idx);
+  /* The no-offload header contract (flags = 0, GSO_NONE) is per-frame,
+     not just an init-time state: nothing else writes these bytes, but
+     zeroing them here keeps the header correct independent of the
+     slot's history.  */
+  vnet_hdr_zero (slot);
   memcpy (slot + VNET_HDR_SIZE, frame, len);
 
   buf.addr = virtio_pool_slot_phys (&d->txpool, *slot_idx);
@@ -297,7 +302,8 @@ vnet_dev_tx (struct vnet_dev *d, const void *frame, size_t len)
   if (err)
     {
       if (err == EIO)
-        d->stats.bad_completions++;
+        __atomic_fetch_add (&d->stats.bad_completions, 1,
+                            __ATOMIC_RELAXED);
       else
         d->stats.tx_errors++;
       pthread_mutex_unlock (&d->tx_lock);
@@ -322,7 +328,9 @@ vnet_dev_quiesce (struct vnet_dev *d)
      while the RX loop reads it concurrently; a torn or cached value
      would strand the join below.  */
   __atomic_store_n (&d->stopping, 1, __ATOMIC_SEQ_CST);
-  /* Wake any TX waiters so they observe stopping and time out promptly.  */
+  /* Let TX waiters recheck their completion state; each still ends at
+     its own one-second deadline, which the in-flight wait below always
+     outlasts.  */
   pthread_mutex_lock (&d->txq.lock);
   pthread_cond_broadcast (&d->txq.cv);
   pthread_mutex_unlock (&d->txq.lock);

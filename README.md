@@ -323,7 +323,9 @@ byte order, NET_FLAGS is a stored int; `device_set_filter` validates and
 installs the caller's BPF program through Hurd's libbpf (`net_set_filter`),
 and RX delivery runs each frame past every open's filter
 (`bpf_do_filter`), dead-name notifications removing filters when a client
-port dies. TX is serialized (one frame in flight), completions are
+port dies. TX submissions are serialized under one lock and the pool's
+slot count bounds the frames in flight (netdde-style fire-and-forget by
+default, wait-for-completion with `--sync`), completions are
 validated by descriptor-head-to-slot map, and RX bad completions are
 counted and dropped with the buffer always reposted, so the queue never
 starves. Frame delivery builds the `net_rcv_msg` exactly as

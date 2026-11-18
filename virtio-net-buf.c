@@ -7,9 +7,9 @@
    the posted buffer, which the length validation below counts as a drop.
 
    TX: one contiguous DMA region of `hdr + frame cap` slots.  Submission
-   is serialized under tx_lock with one chain in flight; a slot whose
-   completion timed out stays marked so the device can never race a
-   reused buffer, exactly the vblk_req_one discipline.
+   is serialized under tx_lock (slots bound the in-flight frames; a slot
+   whose completion timed out stays marked so the device can never race
+   a reused buffer), exactly the vblk_req_one discipline.
 
    Completion mapping: the used entry's id is the chain's head descriptor
    index; desc2slot/head2slot tables translate it back to a pool slot, so
@@ -145,7 +145,7 @@ vnet_rx_one (struct vnet_dev *d, struct virtio_used_elem *used, int notify)
     {
       fprintf (stderr, "virtio-net: RX completion id %u (len %u) is not a "
                "posted buffer\n", used->id, used->len);
-      d->stats.bad_completions++;
+      __atomic_fetch_add (&d->stats.bad_completions, 1, __ATOMIC_RELAXED);
       return;
     }
 
@@ -276,7 +276,7 @@ vnet_buf_rx_legacy_once (struct vnet_dev *d)
     {
       fprintf (stderr, "virtio-net: RX wait failed: %s\n",
                strerror (err));
-      d->stats.bad_completions++;
+      __atomic_fetch_add (&d->stats.bad_completions, 1, __ATOMIC_RELAXED);
       return;
     }
   vnet_rx_one (d, &used, 1);
@@ -289,7 +289,8 @@ vnet_buf_rx_legacy_once (struct vnet_dev *d)
       if (err)
         {
           if (err == EIO)
-            d->stats.bad_completions++;
+            __atomic_fetch_add (&d->stats.bad_completions, 1,
+                                __ATOMIC_RELAXED);
           else
             {
               fprintf (stderr, "virtio-net: RX pop failed: %s\n",
@@ -330,7 +331,8 @@ vnet_buf_rx_poll_once (struct vnet_dev *d)
              was already skipped by the pop (K1-safe), anything else is
              logged and counted without spinning.  */
           if (err == EIO)
-            d->stats.bad_completions++;
+            __atomic_fetch_add (&d->stats.bad_completions, 1,
+                                __ATOMIC_RELAXED);
           else
             {
               fprintf (stderr, "virtio-net: RX pop failed: %s\n",
@@ -375,7 +377,7 @@ vnet_buf_rx_poll_once (struct vnet_dev *d)
   /* Unexpected wait error: same robustness contract as the legacy
      wait_used error path.  */
   fprintf (stderr, "virtio-net: RX wait failed: %s\n", strerror (err));
-  d->stats.bad_completions++;
+  __atomic_fetch_add (&d->stats.bad_completions, 1, __ATOMIC_RELAXED);
 }
 
 /* RX service loop: wait for completions, deliver, replenish.  Runs on its

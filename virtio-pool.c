@@ -250,6 +250,32 @@ virtio_pool_disarm_wait (struct virtio_slot_pool *p, uint16_t slot)
   pthread_mutex_unlock (&p->lock);
 }
 
+/* Under p->lock: consume SLOT's stored completion if a reap delivered
+   it, otherwise classify why the wait must continue.  Returns 0 with
+   *USED filled (or the chain's stored error), EIO when the pool latched
+   a foreign completion while this waiter was registered, and EAGAIN
+   when the completion has not landed yet.  A terminal result consumes
+   the armed waiter (the arm/disarm pairing).  */
+static error_t
+virtio_pool_wait_collect (struct virtio_slot_pool *p, uint16_t slot,
+                          struct virtio_used_elem *used,
+                          uint32_t observed_seq)
+{
+  if (p->slot_done[slot])
+    {
+      *used = p->slot_result[slot];
+      p->slot_done[slot] = 0;
+      p->slot_waiters[slot]--;
+      return p->slot_error[slot];
+    }
+  if (p->pool_error_seq != observed_seq)
+    {
+      p->slot_waiters[slot]--;
+      return EIO;
+    }
+  return EAGAIN;
+}
+
 error_t
 virtio_pool_wait_armed (struct virtio_slot_pool *p, struct virtio_queue *q,
                         uint16_t slot, int timeout_sec,
@@ -270,48 +296,24 @@ virtio_pool_wait_armed (struct virtio_slot_pool *p, struct virtio_queue *q,
     {
       pthread_mutex_lock (&p->lock);
       virtio_pool_reap_locked_impl (p, q);
-      if (p->slot_done[slot])
-        {
-          *used = p->slot_result[slot];
-          p->slot_done[slot] = 0;
-          werr = p->slot_error[slot];
-          p->slot_waiters[slot]--;
-          pthread_mutex_unlock (&p->lock);
-          return werr;
-        }
-      if (p->pool_error_seq != observed_seq)
-        {
-          p->slot_waiters[slot]--;
-          pthread_mutex_unlock (&p->lock);
-          return EIO;
-        }
+      werr = virtio_pool_wait_collect (p, slot, used, observed_seq);
       pthread_mutex_unlock (&p->lock);
+      if (werr != EAGAIN)
+        return werr;
 
       pthread_mutex_lock (&q->lock);
       werr = pthread_cond_timedwait (&q->cv, &q->lock, &deadline);
       pthread_mutex_unlock (&q->lock);
       if (werr != 0)
         {
+          /* The sleep ended on the deadline (or a wait error); one
+             last reap decides between a completion that raced the
+             wakeup and a genuine timeout.  */
           pthread_mutex_lock (&p->lock);
           virtio_pool_reap_locked_impl (p, q);
-          if (p->slot_done[slot])
-            {
-              *used = p->slot_result[slot];
-              p->slot_done[slot] = 0;
-              werr = p->slot_error[slot];
-              p->slot_waiters[slot]--;
-              pthread_mutex_unlock (&p->lock);
-              return werr;
-            }
-          if (p->pool_error_seq != observed_seq)
-            {
-              p->slot_waiters[slot]--;
-              pthread_mutex_unlock (&p->lock);
-              return EIO;
-            }
-          p->slot_waiters[slot]--;
+          werr = virtio_pool_wait_collect (p, slot, used, observed_seq);
           pthread_mutex_unlock (&p->lock);
-          return ETIMEDOUT;
+          return werr == EAGAIN ? ETIMEDOUT : werr;
         }
     }
 }

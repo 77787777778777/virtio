@@ -124,7 +124,10 @@
 /* How long --selftest-traffic waits for a backend reply (seconds).  */
 #define VNET_SELFTEST_RX_WAIT 5
 
-/* I/O counters, printed at teardown and by --verbose completions.  */
+/* I/O counters, printed at teardown and by --verbose completions.
+   Each field belongs to one thread except bad_completions (RX thread
+   and TX waiters both consume foreign completions), which is maintained
+   with atomic adds; single-writer fields are plain.  */
 struct vnet_stats {
   uint64_t rx_packets, rx_bytes;
   uint64_t rx_bad;          /* malformed/oversize/unknown-completion drops */
@@ -132,7 +135,7 @@ struct vnet_stats {
   uint64_t rx_delivery_fail; /* send timeout/queue-full/mismatch drops */
   uint64_t tx_packets, tx_bytes;
   uint64_t tx_errors;
-  uint64_t bad_completions;
+  uint64_t bad_completions; /* cross-thread: updated with atomic adds */
   uint64_t config_changes;
   /* RX moderation (EVENT_IDX mode only): budget-exhausted polling
      passes, armed condvar sleeps and how many timed out, and rearm
@@ -173,9 +176,10 @@ struct vnet_dev {
 
   /* TX pool: the shared slot-pool engine (one contiguous DMA region, one
      device-readable buffer per slot, head2slot completion mapping with
-     the stale-discard wait discipline).  Serialized by tx_lock: one
-     frame in flight, timed-out slots stay marked so the device never
-     races a reused buffer.  */
+     the stale-discard wait discipline).  Submissions are serialized by
+     tx_lock; the pool's slot count bounds the in-flight frames, and
+     timed-out slots stay marked so the device never races a reused
+     buffer.  */
   struct virtio_slot_pool txpool;
   pthread_mutex_t tx_lock;
 
@@ -249,7 +253,7 @@ void vnet_buf_release (struct vnet_dev *);
    no-offload form: flags = 0, GSO_NONE).  */
 void vnet_hdr_zero (char *);
 /* RX service loop: consume rxq completions, validate, deliver, replenish.
-   Returns on STopping; otherwise runs forever.  */
+   Returns on stopping; otherwise runs forever.  */
 void vnet_buf_rx_loop (struct vnet_dev *);
 
 /* virtio-net-hurd.c */

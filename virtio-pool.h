@@ -10,8 +10,11 @@
    buffer, and its used entry is consumed and discarded by whichever
    request waits next (plan blk §4.2 / net §4.3 completion validation).
 
-   The pool takes no locks of its own: net serializes TX with the dev
-   struct's tx_lock, blk is single-threaded per the MVP.  */
+   The pool's own lock (with the arm/wait machinery below) guards the
+   slot tables and completion state, so a completion reaped by one
+   thread is delivered to another thread's registered waiter; drivers
+   still serialize submission themselves (net holds tx_lock, blk
+   req_lock) to bound which slots are handed out concurrently.  */
 
 #ifndef VIRTIO_POOL_H
 #define VIRTIO_POOL_H

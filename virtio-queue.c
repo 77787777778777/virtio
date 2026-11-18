@@ -266,12 +266,37 @@ virtio_queue_post (struct virtio_queue *q, const struct virtio_buf *bufs,
   return virtio_queue_post_head (q, bufs, nbufs, NULL);
 }
 
+/* Under q->lock: consume the next used entry if one is available.
+   Returns 0 with *ELEM filled, EAGAIN when the ring is empty, and EIO
+   for an out-of-range id (the entry is skipped by advancing last_used
+   without recycling descriptors, the K1-safe response to a corrupt
+   ring).  */
+static error_t
+virtio_queue_pop_used_locked (struct virtio_queue *q,
+                              struct virtio_used_elem *elem)
+{
+  if (virtio_idx_acquire (q->used_idx) == q->last_used)
+    return EAGAIN;
+
+  *elem = q->used_ring[q->last_used % q->num];
+  if (elem->id >= q->num)
+    {
+      fprintf (stderr, "%s: queue %u: used entry id %u out of range\n",
+               q->pci->name, q->index, elem->id);
+      q->last_used++;
+      return EIO;
+    }
+  virtio_queue_free_chain (q, elem->id);
+  q->last_used++;
+  return 0;
+}
+
 error_t
 virtio_queue_wait_used (struct virtio_queue *q, int timeout_sec,
                         struct virtio_used_elem *elem)
 {
   struct timespec deadline;
-  int werr;
+  error_t err;
 
   clock_gettime (CLOCK_REALTIME, &deadline);
   deadline.tv_sec += timeout_sec;
@@ -280,9 +305,10 @@ virtio_queue_wait_used (struct virtio_queue *q, int timeout_sec,
   /* The used index is the condition itself, not a flag: config-change
      interrupts and leftover signals produce wakeups with nothing new in
      the ring, which simply loop back to waiting.  */
-  while (virtio_idx_acquire (q->used_idx) == q->last_used)
+  while ((err = virtio_queue_pop_used_locked (q, elem)) == EAGAIN)
     {
-      werr = pthread_cond_timedwait (&q->cv, &q->lock, &deadline);
+      int werr = pthread_cond_timedwait (&q->cv, &q->lock, &deadline);
+
       if (werr != 0)
         {
           pthread_mutex_unlock (&q->lock);
@@ -292,45 +318,20 @@ virtio_queue_wait_used (struct virtio_queue *q, int timeout_sec,
           return ETIMEDOUT;
         }
     }
-
-  *elem = q->used_ring[q->last_used % q->num];
-  if (elem->id >= q->num)
-    {
-      fprintf (stderr, "%s: queue %u: used entry id %u out of range\n",
-               q->pci->name, q->index, elem->id);
-      q->last_used++;
-      pthread_mutex_unlock (&q->lock);
-      return EIO;
-    }
-  virtio_queue_free_chain (q, elem->id);
-  q->last_used++;
   pthread_mutex_unlock (&q->lock);
-  return 0;
+  return err;
 }
 
 error_t
-virtio_queue_try_pop_used (struct virtio_queue *q, struct virtio_used_elem *out)
+virtio_queue_try_pop_used (struct virtio_queue *q,
+                           struct virtio_used_elem *out)
 {
-  pthread_mutex_lock (&q->lock);
-  if (virtio_idx_acquire (q->used_idx) == q->last_used)
-    {
-      pthread_mutex_unlock (&q->lock);
-      return EAGAIN;
-    }
+  error_t err;
 
-  *out = q->used_ring[q->last_used % q->num];
-  if (out->id >= q->num)
-    {
-      fprintf (stderr, "%s: queue %u: used entry id %u out of range\n",
-               q->pci->name, q->index, out->id);
-      q->last_used++;
-      pthread_mutex_unlock (&q->lock);
-      return EIO;
-    }
-  virtio_queue_free_chain (q, out->id);
-  q->last_used++;
+  pthread_mutex_lock (&q->lock);
+  err = virtio_queue_pop_used_locked (q, out);
   pthread_mutex_unlock (&q->lock);
-  return 0;
+  return err;
 }
 
 /* Split EVENT_IDX used-notification moderation.  The device-side rule

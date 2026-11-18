@@ -353,16 +353,21 @@ selftest_traffic (struct vnet_dev *d)
           VNET_SELFTEST_RX_WAIT);
   for (i = 0; i < VNET_SELFTEST_RX_WAIT * 10; i++)
     {
+      /* Atomic: the RX thread updates these counters concurrently.  */
+      uint64_t pkts = __atomic_load_n (&d->stats.rx_packets,
+                                       __ATOMIC_RELAXED);
+      uint64_t bytes = __atomic_load_n (&d->stats.rx_bytes,
+                                        __ATOMIC_RELAXED);
+
       usleep (100 * 1000);
-      if (d->stats.rx_packets)
+      if (pkts)
         {
           printf ("raw RX observed: %llu packet(s), %llu bytes\n",
-                  (unsigned long long) d->stats.rx_packets,
-                  (unsigned long long) d->stats.rx_bytes);
+                  (unsigned long long) pkts, (unsigned long long) bytes);
           break;
         }
     }
-  if (!d->stats.rx_packets)
+  if (!__atomic_load_n (&d->stats.rx_packets, __ATOMIC_RELAXED))
     printf ("no backend traffic observed (backend-dependent; not a "
             "selftest failure)\n");
 
