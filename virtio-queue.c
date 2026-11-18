@@ -112,6 +112,18 @@ virtio_queue_setup (struct virtio_pci_dev *v, struct virtio_queue *q,
   q->last_used = 0;
   q->region_phys = region_phys;
 
+  /* The split event fields the layout already reserved: used_event
+     follows the avail ring, avail_event follows the used ring (the
+     vring_init layout the region size above accounts for).  They stay
+     unused until a driver negotiates EVENT_IDX and enables the queue.  */
+  q->avail_flags = (volatile uint16_t *) ((char *) region + avail_off);
+  q->used_event = (volatile uint16_t *) ((char *) region + avail_off + 4
+                                         + 2 * (size_t) num);
+  q->avail_event = (volatile const uint16_t *) ((char *) region + used_off
+                                                + 4
+                                                + (size_t) num * 8);
+  q->event_idx_enabled = 0;
+
   pthread_mutex_init (&q->lock, NULL);
   pthread_cond_init (&q->cv, NULL);
 
@@ -169,9 +181,9 @@ virtio_queue_free_chain (struct virtio_queue *q, uint16_t head)
   while (idx != VIRTIO_QUEUE_NO_DESC);
 }
 
-error_t
-virtio_queue_post_head (struct virtio_queue *q, const struct virtio_buf *bufs,
-                        uint16_t nbufs, uint16_t *head_out)
+static error_t
+virtio_queue_post_head_n (struct virtio_queue *q, const struct virtio_buf *bufs,
+                          uint16_t nbufs, uint16_t *head_out, int notify)
 {
   uint16_t head, prev, i;
 
@@ -215,11 +227,36 @@ virtio_queue_post_head (struct virtio_queue *q, const struct virtio_buf *bufs,
   virtio_wmb ();
   (*q->avail_idx)++;
   virtio_wmb ();
-  virtio_pci_outw (q->pci, VIRTIO_PCI_QUEUE_NOTIFY, q->index);
+  if (notify)
+    virtio_pci_outw (q->pci, VIRTIO_PCI_QUEUE_NOTIFY, q->index);
   if (head_out)
     *head_out = head;
   pthread_mutex_unlock (&q->lock);
   return 0;
+}
+
+error_t
+virtio_queue_post_head (struct virtio_queue *q, const struct virtio_buf *bufs,
+                        uint16_t nbufs, uint16_t *head_out)
+{
+  return virtio_queue_post_head_n (q, bufs, nbufs, head_out, 1);
+}
+
+error_t
+virtio_queue_post_head_deferred (struct virtio_queue *q,
+                                 const struct virtio_buf *bufs,
+                                 uint16_t nbufs, uint16_t *head_out)
+{
+  return virtio_queue_post_head_n (q, bufs, nbufs, head_out, 0);
+}
+
+void
+virtio_queue_notify (struct virtio_queue *q)
+{
+  /* The fence orders the avail publishes of any deferred posts before
+     the kick, independent of the posting path that preceded it.  */
+  virtio_wmb ();
+  virtio_pci_outw (q->pci, VIRTIO_PCI_QUEUE_NOTIFY, q->index);
 }
 
 error_t
@@ -292,6 +329,123 @@ virtio_queue_try_pop_used (struct virtio_queue *q, struct virtio_used_elem *out)
     }
   virtio_queue_free_chain (q, out->id);
   q->last_used++;
+  pthread_mutex_unlock (&q->lock);
+  return 0;
+}
+
+/* Split EVENT_IDX used-notification moderation.  The device-side rule
+   (QEMU virtio_split_should_notify) is: at every completion the device
+   compares the used index it recorded at its previous completion check
+   against the published used_event threshold, interrupts when that
+   recorded index is at or below the threshold, and then records the
+   current used index whether or not it interrupts.  At a quiet queue
+   the recorded index equals the used index, so a threshold at the
+   consumed position (arm) interrupts for the next completion and then
+   goes quiet, and a threshold one below the current used index
+   (suppress) is already passed and stays quiet.  The recorded index
+   never exceeds the used index, which is what makes the
+   arm-at-last_used value safe: at an idle, fully drained queue the
+   next push always satisfies the test.
+
+   Every publish is a full barrier (virtio_wmb), so the store is ordered
+   before the caller's recheck load of used_idx: a completion that raced
+   the publish cannot deliver an interrupt, but it is observed by the
+   recheck, which is why sleeping without the recheck is forbidden.  */
+static void
+virtio_queue_publish_used_event (struct virtio_queue *q, uint16_t threshold)
+{
+  *q->used_event = threshold;
+  virtio_wmb ();
+}
+
+void
+virtio_queue_set_event_idx (struct virtio_queue *q, int enabled)
+{
+  q->event_idx_enabled = !!enabled;
+  if (q->event_idx_enabled)
+    /* Legacy-equivalent baseline: every completion interrupts until the
+       consumer's disable/prepare cycle takes over.  This also covers a
+       device-wide EVENT_IDX negotiation for queues that never poll, so
+       their waiters keep the pre-EVENT_IDX wakeup behavior.  */
+    virtio_queue_used_notify_always (q);
+}
+
+void
+virtio_queue_used_notify_always (struct virtio_queue *q)
+{
+  if (!q->event_idx_enabled)
+    return;
+  /* Half the 16-bit index space ahead of the used index: the device
+     cannot satisfy the notify test until it laps the threshold, and
+     with at most VIRTIO_QUEUE_MAX buffers ever in flight it cannot
+     advance that far while the driver keeps consuming.  */
+  pthread_mutex_lock (&q->lock);
+  virtio_queue_publish_used_event (q, (uint16_t) (*q->used_idx + 0x7fff));
+  pthread_mutex_unlock (&q->lock);
+}
+
+void
+virtio_queue_disable_used_cb (struct virtio_queue *q)
+{
+  uint16_t used;
+
+  if (!q->event_idx_enabled)
+    return;
+  used = virtio_idx_acquire (q->used_idx);
+  pthread_mutex_lock (&q->lock);
+  /* One below the current used index: the device's recorded index (the
+     used index at its last completion) already exceeds the threshold,
+     so pushes after this publish stay quiet while the consumer polls.
+     A push racing the publish was decided under the previous threshold
+     and may still interrupt; extra interrupts are harmless because
+     sleeps always rearm first.  */
+  virtio_queue_publish_used_event (q, (uint16_t) (used - 1));
+  pthread_mutex_unlock (&q->lock);
+}
+
+uint16_t
+virtio_queue_enable_used_cb_prepare (struct virtio_queue *q)
+{
+  uint16_t token;
+
+  pthread_mutex_lock (&q->lock);
+  token = q->last_used;
+  if (q->event_idx_enabled)
+    virtio_queue_publish_used_event (q, token);
+  pthread_mutex_unlock (&q->lock);
+  return token;
+}
+
+int
+virtio_queue_poll_used (const struct virtio_queue *q, uint16_t token)
+{
+  return virtio_idx_acquire (q->used_idx) != token;
+}
+
+error_t
+virtio_queue_wait_progress (struct virtio_queue *q, uint16_t token,
+                            int timeout_sec)
+{
+  struct timespec deadline;
+  int werr;
+
+  clock_gettime (CLOCK_REALTIME, &deadline);
+  deadline.tv_sec += timeout_sec;
+
+  pthread_mutex_lock (&q->lock);
+  /* Same predicate discipline as virtio_queue_wait_used, minus the
+     consume: config-change interrupts and leftover signals produce
+     wakeups with no new completions, which simply loop back to
+     waiting.  */
+  while (virtio_idx_acquire (q->used_idx) == token)
+    {
+      werr = pthread_cond_timedwait (&q->cv, &q->lock, &deadline);
+      if (werr != 0)
+        {
+          pthread_mutex_unlock (&q->lock);
+          return ETIMEDOUT;
+        }
+    }
   pthread_mutex_unlock (&q->lock);
   return 0;
 }

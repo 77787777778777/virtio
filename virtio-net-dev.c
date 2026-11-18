@@ -50,9 +50,17 @@ vnet_dev_bring_up (struct vnet_dev *d, const char *override)
       return ENOTSUP;
     }
   d->accepted = d->offered & VNET_FEATURES;
+  /* Opt-in RX moderation: EVENT_IDX is a transport-wide feature, so
+     accepting it switches every queue of this device to threshold-based
+     notifications; both queues are enabled below to preserve their
+     wakeup behavior, and only the RX loop then moderates.  */
+  if (vnet_event_idx)
+    d->accepted |= d->offered & (1u << VIRTIO_RING_F_EVENT_IDX);
   virtio_pci_set_guest_features (&d->pci, d->accepted);
-  fprintf (stderr, "virtio-net: offered features 0x%x, accepted 0x%x\n",
-           d->offered, d->accepted);
+  fprintf (stderr, "virtio-net: offered features 0x%x, accepted 0x%x%s\n",
+           d->offered, d->accepted,
+           d->accepted & (1u << VIRTIO_RING_F_EVENT_IDX)
+           ? " (RX EVENT_IDX moderation)" : "");
   /* Ack any interrupt the handshake itself raised.  */
   virtio_pci_read_isr (&d->pci);
 
@@ -62,6 +70,18 @@ vnet_dev_bring_up (struct vnet_dev *d, const char *override)
   err = virtio_queue_setup (&d->pci, &d->txq, VNET_VQ_TX);
   if (err)
     return err;
+
+  /* Arm both queues before anything can complete: the RX queue starts
+     in the legacy-equivalent always-notify state until the RX thread's
+     moderation cycle takes over, and the TX queue keeps it permanently
+     (its waiters rely on per-completion interrupts).  Single-threaded
+     here: the RX thread that reads event_idx_enabled starts later.  */
+  virtio_queue_set_event_idx (&d->rxq,
+                              (d->accepted
+                               & (1u << VIRTIO_RING_F_EVENT_IDX)) != 0);
+  virtio_queue_set_event_idx (&d->txq,
+                              (d->accepted
+                               & (1u << VIRTIO_RING_F_EVENT_IDX)) != 0);
 
   err = virtio_pci_driver_ok (&d->pci);
   if (err)
@@ -201,6 +221,12 @@ vnet_dev_tx (struct vnet_dev *d, const void *frame, size_t len)
   buf.len = VNET_HDR_SIZE + len;
   buf.flags = 0;  /* the device reads header and frame */
 
+  /* Under EVENT_IDX the device notifies only while its last-notified
+     index is at or below the published threshold, so every submission
+     refreshes the far-ahead threshold: without this, notifications
+     would stop once the device passed the value published at init and
+     every TX wait would fall back to its one-second timeout.  */
+  virtio_queue_used_notify_always (&d->txq);
   err = virtio_pool_submit (&d->txpool, &d->txq, slot_idx, &buf, 1, NULL);
   if (err)
     {

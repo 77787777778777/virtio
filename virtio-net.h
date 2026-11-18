@@ -116,6 +116,11 @@
 /* Bounded retries for RX replenish after a slot detach (K3).  */
 #define VNET_RX_REPLENISH_RETRIES 3
 
+/* Completions consumed per polling pass in EVENT_IDX mode before the RX
+   thread stops suppressing interrupts, recovers retired slots, rearms
+   and sleeps (stuff/napi_plan.md section 5.5).  */
+#define VNET_RX_POLL_BUDGET 64
+
 /* How long --selftest-traffic waits for a backend reply (seconds).  */
 #define VNET_SELFTEST_RX_WAIT 5
 
@@ -129,6 +134,13 @@ struct vnet_stats {
   uint64_t tx_errors;
   uint64_t bad_completions;
   uint64_t config_changes;
+  /* RX moderation (EVENT_IDX mode only): budget-exhausted polling
+     passes, armed condvar sleeps and how many timed out, and rearm
+     races (progress observed right after arming).  */
+  uint64_t rx_poll_passes;
+  uint64_t rx_idle_waits;
+  uint64_t rx_wait_timeouts;
+  uint64_t rx_rearm_races;
 };
 
 struct vnet_dev {
@@ -197,6 +209,13 @@ struct vnet_hurd {
 };
 
 extern int vnet_verbose;
+
+/* RX used-notification moderation policy (--event-idx): when set, the
+   driver also accepts the split-ring EVENT_IDX feature and runs the RX
+   loop in budgeted-polling mode with race-safe interrupt rearming.
+   Default off until the feature is validated against the target
+   device.  */
+extern int vnet_event_idx;
 
 /* virtio-net.c */
 error_t vnet_start_device (const char *override);

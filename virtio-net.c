@@ -30,13 +30,15 @@
 const char *argp_program_version = "virtio-net 0.1";
 
 int vnet_verbose;
+int vnet_event_idx;
 
 /* Keys for the long-only options; 0 would not distinguish them.  */
 enum {
   OPT_STATUS = 1000,
   OPT_TRAFFIC,
   OPT_SERVE,
-  OPT_NAME
+  OPT_NAME,
+  OPT_EVENT_IDX
 };
 
 static const char *opt_device;
@@ -66,6 +68,9 @@ static const struct argp_option options[] =
   {"name", OPT_NAME, "NAME", 0,
    "With --serve: only accept device_open for this name (default: accept "
    "any, including the \"eth\" name pfinet opens with)"},
+  {"event-idx", OPT_EVENT_IDX, 0, 0,
+   "Enable split-ring EVENT_IDX used-notification moderation on RX "
+   "(budgeted polling with race-safe interrupt rearming; default off)"},
   {"verbose", 'v', 0, 0,
    "Log deliveries, completions, and port activity"},
   {0}
@@ -96,6 +101,9 @@ parse_opt (int key, char *arg, struct argp_state *state)
       break;
     case OPT_NAME:
       opt_name = arg;
+      break;
+    case OPT_EVENT_IDX:
+      vnet_event_idx = 1;
       break;
     default:
       return ARGP_ERR_UNKNOWN;
@@ -712,6 +720,15 @@ main (int argc, char **argv)
              (unsigned long long) s->tx_errors,
              (unsigned long long) s->bad_completions,
              (unsigned long long) s->config_changes);
+    if (s->rx_poll_passes || s->rx_idle_waits || s->rx_wait_timeouts
+        || s->rx_rearm_races)
+      fprintf (stderr,
+               "virtio-net: RX moderation: %llu budget-exhausted passes, "
+               "%llu armed waits (%llu timed out), %llu rearm races\n",
+               (unsigned long long) s->rx_poll_passes,
+               (unsigned long long) s->rx_idle_waits,
+               (unsigned long long) s->rx_wait_timeouts,
+               (unsigned long long) s->rx_rearm_races);
   }
   return 0;
 }

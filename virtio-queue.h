@@ -27,6 +27,14 @@
 /* Sentinel for "no descriptor"; valid indices are below VIRTIO_QUEUE_MAX.  */
 #define VIRTIO_QUEUE_NO_DESC 0xffff
 
+/* Split-ring notification-threshold feature, bit 29 of the 32-bit legacy
+   feature word.  When negotiated, the driver publishes its
+   used-notification threshold in the avail ring's used_event tail field
+   (the device interrupts when the used index passes it), and the device
+   publishes its kick threshold in the used ring's avail_event tail
+   field.  */
+#define VIRTIO_RING_F_EVENT_IDX 29
+
 /* One buffer posted to a virtqueue: one descriptor.  */
 struct virtio_buf {
   uint64_t addr;
@@ -57,6 +65,19 @@ struct virtio_queue {
   struct virtio_used_elem *used_ring;
   uint16_t last_used;
   uint16_t free_head;
+  /* Split EVENT_IDX event fields.  The vring layout reserves the tail
+     fields whether or not the feature is negotiated; the pointers are
+     valid from queue setup on, but the driver must only publish into
+     used_event once the feature is accepted, because the device
+     interprets the field the moment the feature bit is set.  avail_event
+     is the device's kick threshold, read-only here (kick suppression is
+     deliberately not implemented; see stuff/napi_plan.md Phase 3).  */
+  volatile uint16_t *avail_flags;
+  volatile uint16_t *used_event;
+  volatile const uint16_t *avail_event;
+  /* Per-queue notification-policy enable; written only at init, before
+     the queue's completion-consumer thread starts.  */
+  int event_idx_enabled;
   pthread_mutex_t lock;
   pthread_cond_t cv;
   uint64_t region_phys;
@@ -94,6 +115,16 @@ error_t virtio_queue_post (struct virtio_queue *, const struct virtio_buf *,
 error_t virtio_queue_post_head (struct virtio_queue *, const struct virtio_buf *,
                                 uint16_t nbufs, uint16_t *head_out);
 
+/* Like virtio_queue_post_head, but returns without kicking the device:
+   the caller batches a pass worth of posts and publishes them with one
+   virtio_queue_notify, saving one VM exit per buffer.  */
+error_t virtio_queue_post_head_deferred (struct virtio_queue *,
+                                         const struct virtio_buf *,
+                                         uint16_t nbufs, uint16_t *head_out);
+/* Kick the device after deferred posts.  Safe (if pointless) with
+   nothing new posted.  */
+void virtio_queue_notify (struct virtio_queue *);
+
 /* Wait for one used entry and return it; the completed descriptor chain is
    recycled.  TIMEOUT_SEC bounds the interrupt wait (the fallback for a lost
    interrupt, not the normal completion path).  */
@@ -105,6 +136,60 @@ error_t virtio_queue_wait_used (struct virtio_queue *, int timeout_sec,
    recycling descriptors).  */
 error_t virtio_queue_try_pop_used (struct virtio_queue *,
                                    struct virtio_used_elem *);
+
+
+/* Used-notification moderation over split EVENT_IDX (design and race
+   rules in stuff/napi_plan.md): the device interrupts when the used
+   index passes the published threshold, so arming at the consumed
+   position yields exactly one interrupt for the next completion, and
+   sleeping on the queue condvar is safe only after that publish, a
+   barrier, and a recheck of the used index.  The arm/suppress/wait trio
+   and the poll belong to the queue's completion-consumer thread;
+   used_notify_always is for submitter threads; set_event_idx runs once
+   at init, before any consumer or submitter exists.
+
+   With event_idx_enabled clear they are no-ops or legacy-equivalent:
+   without the negotiated feature the device interrupts per completion
+   (avail flags stay zero), which is the behavior every driver had
+   before this API existed.  */
+
+/* Enable moderation on this queue; only valid once EVENT_IDX was
+   negotiated device-wide and before the consumer thread starts.
+   Publishes a far-ahead threshold so every completion interrupts (the
+   legacy always-notify behavior) until the consumer's
+   disable/prepare cycle takes over.  */
+void virtio_queue_set_event_idx (struct virtio_queue *, int enabled);
+
+/* Keep per-completion interrupts flowing on a posting queue: refresh
+   the far-ahead threshold.  Must be re-run before the device can
+   advance half the 16-bit index space past the published value, which
+   cannot happen while fewer than VIRTIO_QUEUE_MAX buffers are ever in
+   flight, but a long-lived queue republishes per submission anyway.  */
+void virtio_queue_used_notify_always (struct virtio_queue *);
+
+/* Quiet the device while the consumer polls (budgeted drain).  At most
+   one more interrupt can arrive afterwards; any imperfection only
+   costs a harmless wakeup, never a missed one, because sleeps always
+   rearm first.  */
+void virtio_queue_disable_used_cb (struct virtio_queue *);
+
+/* Arm the next completion and return the poll token: publish the
+   consumed position as the threshold, with the store ordered before the
+   caller's recheck.  */
+uint16_t virtio_queue_enable_used_cb_prepare (struct virtio_queue *);
+
+/* True when the device published completions beyond TOKEN; call after
+   enable_used_cb_prepare and before sleeping to close the arm race.  */
+int virtio_queue_poll_used (const struct virtio_queue *, uint16_t token);
+
+/* Sleep until the used index differs from TOKEN or the timeout elapses.
+   Unlike virtio_queue_wait_used nothing is consumed, no chain is
+   recycled and last_used is untouched; the caller drains with
+   try_pop_used after this returns.  Config-change wakeups with no
+   progress keep waiting (the used index is the condition).  Returns 0
+   on observed progress, ETIMEDOUT.  */
+error_t virtio_queue_wait_progress (struct virtio_queue *, uint16_t token,
+                                    int timeout_sec);
 
 
 /* Install/remove the INTx handler (libirqhelp).  Removal resets the device

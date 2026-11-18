@@ -95,7 +95,7 @@ vnet_buf_init (struct vnet_dev *d)
       buf.addr = d->rx_bufs_phys + (uint64_t) n * d->rx_buf_size;
       buf.len = d->rx_buf_size;
       buf.flags = VIRTQ_DESC_F_WRITE;
-      err = virtio_queue_post (&d->rxq, &buf, 1);
+      err = virtio_queue_post_head_deferred (&d->rxq, &buf, 1, NULL);
       if (err)
         {
           fprintf (stderr, "virtio-net: RX prefill stalled at %u/%u: %s\n",
@@ -104,6 +104,8 @@ vnet_buf_init (struct vnet_dev *d)
         }
       d->rx_desc2slot[head] = n;
     }
+  /* One kick publishes the whole prefill batch.  */
+  virtio_queue_notify (&d->rxq);
   fprintf (stderr, "virtio-net: %u RX buffers of %zu bytes posted, "
            "%u TX slots\n", d->rx_nslots, d->rx_buf_size, d->txpool.nslots);
   return 0;
@@ -128,9 +130,12 @@ vnet_buf_release (struct vnet_dev *d)
 
 /* Consume one RX completion, validate it against the pool, and hand the
    Ethernet frame (after the virtio-net header) to the Hurd layer.  The
-   buffer is always reposted, on every path, so the queue never drains.  */
+   buffer is always reposted, on every path, so the queue never drains.
+   NOTIFY selects the legacy per-buffer kick (callers that post one
+   buffer per wait) or a deferred kick the caller issues once per
+   polling pass.  */
 static void
-vnet_rx_one (struct vnet_dev *d, struct virtio_used_elem *used)
+vnet_rx_one (struct vnet_dev *d, struct virtio_used_elem *used, int notify)
 {
   struct virtio_buf buf;
   uint16_t slot;
@@ -190,7 +195,10 @@ vnet_rx_one (struct vnet_dev *d, struct virtio_used_elem *used)
     for (retries = 0; retries < VNET_RX_REPLENISH_RETRIES; retries++)
       {
         post_head = d->rxq.free_head;
-        if (virtio_queue_post_head (&d->rxq, &buf, 1, &post_head) == 0)
+        if ((notify
+             ? virtio_queue_post_head (&d->rxq, &buf, 1, &post_head)
+             : virtio_queue_post_head_deferred (&d->rxq, &buf, 1,
+                                                &post_head)) == 0)
           break;
       }
     if (retries >= VNET_RX_REPLENISH_RETRIES)
@@ -249,51 +257,140 @@ vnet_rx_recover_retired (struct vnet_dev *d)
   d->rx_nretired = j;
 }
 
+/* One legacy-path iteration (EVENT_IDX not enabled): block for one
+   completion, deliver it, batch-drain the rest, recover.  The wait
+   timeout is the lost-interrupt fallback and the teardown poll
+   interval, so every error below continues the loop rather than
+   spinning or exiting.  */
+static void
+vnet_buf_rx_legacy_once (struct vnet_dev *d)
+{
+  struct virtio_used_elem used;
+  error_t err;
+
+  vnet_rx_recover_retired (d);
+  err = virtio_queue_wait_used (&d->rxq, 1, &used);
+  if (err == ETIMEDOUT)
+    return;
+  if (err)
+    {
+      fprintf (stderr, "virtio-net: RX wait failed: %s\n",
+               strerror (err));
+      d->stats.bad_completions++;
+      return;
+    }
+  vnet_rx_one (d, &used, 1);
+  /* Batch-drain any additional completions already available.  */
+  for (;;)
+    {
+      err = virtio_queue_try_pop_used (&d->rxq, &used);
+      if (err == EAGAIN)
+        break;
+      if (err)
+        {
+          if (err == EIO)
+            d->stats.bad_completions++;
+          else
+            {
+              fprintf (stderr, "virtio-net: RX pop failed: %s\n",
+                       strerror (err));
+              d->stats.rx_bad++;
+            }
+          break;
+        }
+      vnet_rx_one (d, &used, 1);
+    }
+  vnet_rx_recover_retired (d);
+}
+
+/* One moderated-path iteration (EVENT_IDX enabled, the
+   publish -> barrier -> recheck -> sleep discipline of
+   stuff/napi_plan.md section 5.5).  Drains up to VNET_RX_POLL_BUDGET
+   completions without blocking; only when the queue runs dry does it
+   recover, arm the next-completion interrupt, recheck for the arm race,
+   and sleep on the queue condvar.  The rearm recheck is what makes the
+   sleep safe: a completion that raced the threshold publish cannot
+   deliver an interrupt, but it is visible in the used index.  */
+static void
+vnet_buf_rx_poll_once (struct vnet_dev *d)
+{
+  struct virtio_used_elem used;
+  uint16_t token;
+  unsigned drained;
+  error_t err;
+
+  for (drained = 0; drained < VNET_RX_POLL_BUDGET; drained++)
+    {
+      err = virtio_queue_try_pop_used (&d->rxq, &used);
+      if (err == EAGAIN)
+        break;
+      if (err)
+        {
+          /* Same accounting as the legacy batch drain: a bad used id
+             was already skipped by the pop (K1-safe), anything else is
+             logged and counted without spinning.  */
+          if (err == EIO)
+            d->stats.bad_completions++;
+          else
+            {
+              fprintf (stderr, "virtio-net: RX pop failed: %s\n",
+                       strerror (err));
+              d->stats.rx_bad++;
+            }
+          break;
+        }
+      vnet_rx_one (d, &used, 0);
+    }
+
+  if (drained == VNET_RX_POLL_BUDGET)
+    {
+      /* Still busy: keep polling with the device quiet.  No sleep can
+         happen until the queue runs dry and the rearm below runs.  */
+      d->stats.rx_poll_passes++;
+      virtio_queue_disable_used_cb (&d->rxq);
+      /* One kick publishes the whole pass's deferred replenish batch.  */
+      virtio_queue_notify (&d->rxq);
+      return;
+    }
+
+  vnet_rx_recover_retired (d);
+  /* The deferred replenishes of this pass need exactly one kick; the
+     recovery path (rare) kicked per post itself.  */
+  if (drained)
+    virtio_queue_notify (&d->rxq);
+  token = virtio_queue_enable_used_cb_prepare (&d->rxq);
+  if (virtio_queue_poll_used (&d->rxq, token))
+    {
+      d->stats.rx_rearm_races++;
+      return;
+    }
+  d->stats.rx_idle_waits++;
+  err = virtio_queue_wait_progress (&d->rxq, token, 1);
+  if (err == 0 || err == ETIMEDOUT)
+    {
+      if (err == ETIMEDOUT)
+        d->stats.rx_wait_timeouts++;
+      return;
+    }
+  /* Unexpected wait error: same robustness contract as the legacy
+     wait_used error path.  */
+  fprintf (stderr, "virtio-net: RX wait failed: %s\n", strerror (err));
+  d->stats.bad_completions++;
+}
+
 /* RX service loop: wait for completions, deliver, replenish.  Runs on its
    own thread; the periodic timeout is the lost-interrupt fallback that
    also provides the teardown poll interval.  */
 void
 vnet_buf_rx_loop (struct vnet_dev *d)
 {
-  struct virtio_used_elem used;
-  error_t err;
-
   /* Atomic load: stopping is written by the teardown thread (quiesce
      or the daemon stop path) while this loop runs.  */
   while (!__atomic_load_n (&d->stopping, __ATOMIC_SEQ_CST))
     {
-      vnet_rx_recover_retired (d);
-      err = virtio_queue_wait_used (&d->rxq, 1, &used);
-      if (err == ETIMEDOUT)
-        continue;
-      if (err)
-        {
-          fprintf (stderr, "virtio-net: RX wait failed: %s\n",
-                   strerror (err));
-          d->stats.bad_completions++;
-          continue;
-        }
-      vnet_rx_one (d, &used);
-      /* Batch-drain any additional completions already available.  */
-      for (;;)
-        {
-          err = virtio_queue_try_pop_used (&d->rxq, &used);
-          if (err == EAGAIN)
-            break;
-          if (err)
-            {
-              if (err == EIO)
-                d->stats.bad_completions++;
-              else
-                {
-                  fprintf (stderr, "virtio-net: RX pop failed: %s\n",
-                           strerror (err));
-                  d->stats.rx_bad++;
-                }
-              break;
-            }
-          vnet_rx_one (d, &used);
-        }
-      vnet_rx_recover_retired (d);
+      if (d->rxq.event_idx_enabled)
+        vnet_buf_rx_poll_once (d);
+      else
+        vnet_buf_rx_legacy_once (d);
     }
 }
