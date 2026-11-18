@@ -58,6 +58,58 @@ static struct bpf_insn accept_all[] =
   { BPF_RET | BPF_K, 0, 0, 0 },
 };
 
+/* No NETF_IN or NETF_OUT: refused before the filter list is touched. */
+static struct bpf_insn no_direction[] =
+{
+  { NETF_BPF, 0, 0, 0 },
+  { BPF_RET | BPF_K, 0, 0, 0 },
+};
+
+/* Whether any task holds a send right for the receive right RCV. */
+static int has_senders(mach_port_t rcv)
+{
+  struct mach_port_status status;
+
+  return mach_port_get_receive_status(mach_task_self(), rcv, &status) == 0
+         && status.mps_srights;
+}
+
+/* A request that the driver refuses must leave an installed filter as it
+   was.  This task keeps no send right for PORT, so the filter's is the
+   only one, and its presence shows whether the driver still holds it. */
+static void check_refused_filters(device_t dev)
+{
+  mach_port_t port;
+  error_t err;
+
+  err = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+  if (err)
+    {
+      record("refused filters: port allocated", 0, mach_error_string(err));
+      return;
+    }
+
+  err = device_set_filter(dev, port, MACH_MSG_TYPE_MAKE_SEND, 0,
+                          (filter_t *) accept_all,
+                          sizeof(accept_all) / sizeof(filter_t));
+  record("filter installed for a second port", err == 0 && has_senders(port),
+         err ? mach_error_string(err) : NULL);
+
+  err = device_set_filter(dev, port, MACH_MSG_TYPE_MAKE_SEND, 0,
+                          (filter_t *) no_direction,
+                          sizeof(no_direction) / sizeof(filter_t));
+  record("filter without a direction refused", err != 0, NULL);
+  record("installed filter keeps its send right after a refused one",
+         has_senders(port), NULL);
+
+  err = device_set_filter(dev, MACH_PORT_NULL, MACH_MSG_TYPE_MAKE_SEND, 0,
+                          (filter_t *) accept_all,
+                          sizeof(accept_all) / sizeof(filter_t));
+  record("filter for a null port refused", err != 0, NULL);
+
+  mach_port_destroy(mach_task_self(), port);
+}
+
 static void selftest_arp_frame(uint8_t *f)
 {
   static const uint8_t bcast[6] = { 0xff,0xff,0xff,0xff,0xff,0xff };
@@ -127,6 +179,8 @@ static int do_test(const char *node)
       record("RX frame received (timeout ok)", mr == MACH_RCV_TIMED_OUT,
              mach_error_string(mr));
   }
+
+  check_refused_filters(dev);
 
   mach_port_destroy(mach_task_self(), rcv);
   device_close(dev);
