@@ -177,49 +177,57 @@ vnet_dev_link_up (struct vnet_dev *d)
   return d->have_status ? (d->link_status & VNET_STATUS_LINK_UP) != 0 : 1;
 }
 
-/* Build, post, and await one TX chain: [zeroed 10-byte legacy header]
-   [frame], both device-readable.  Serialized under tx_lock so one frame
-   is in flight; a slot whose completion timed out stays marked so the
-   device can never race a reused buffer.  QEMU pushes TX completions
-   with used.len = 0 (hw/net/virtio-net.c), so the length is not
-   validated beyond the id mapping the pool engine applies.  */
-error_t
-vnet_dev_tx (struct vnet_dev *d, const void *frame, size_t len)
+/* Build and post one TX chain: [zeroed 10-byte legacy header] [frame],
+   both device-readable.  Submission is serialized under tx_lock; a slot
+   whose wait timed out stays marked so the device can never race a
+   reused buffer.  Default is netdde-style fire-and-forget: the frame is
+   queued and later submissions reap its completion, so the slot count
+   bounds the in-flight frames and a stalled backend becomes EAGAIN
+   backpressure instead of a per-frame stall.  With --sync the writer
+   waits for the backend completion and tracks the wait in tx_inflight
+   so teardown does not free the pool under a sleeper.  QEMU pushes TX
+   completions with used.len = 0 (hw/net/virtio-net.c), so the length is
+   not validated beyond the id mapping the pool engine applies.  */
+
+/* The submit half, under tx_lock: reap finished completions, take a
+   slot, copy the frame in, and submit.  ARM_WAIT registers the
+   completion waiter before submission so a concurrent submitter's reap
+   cannot consume this chain's completion in the window before the
+   waiter starts waiting (the reap would discard the result and stall
+   this writer until its timeout).  */
+static error_t
+vnet_tx_submit (struct vnet_dev *d, const void *frame, size_t len,
+                uint16_t *slot_idx, int arm_wait)
 {
   struct virtio_buf buf;
-  struct virtio_used_elem used;
   char *slot;
-  uint16_t slot_idx;
   error_t err;
 
-  if (__atomic_load_n (&d->stopping, __ATOMIC_SEQ_CST))
-    return EIO;
-
-  pthread_mutex_lock (&d->tx_lock);
-
   virtio_pool_reap (&d->txpool, &d->txq);
-  err = virtio_pool_alloc_slot (&d->txpool, &slot_idx);
+  err = virtio_pool_alloc_slot (&d->txpool, slot_idx);
   if (err)
     {
       /* Reap any completions that landed since the last submission
          before declaring exhaustion.  */
       virtio_pool_reap (&d->txpool, &d->txq);
-      err = virtio_pool_alloc_slot (&d->txpool, &slot_idx);
+      err = virtio_pool_alloc_slot (&d->txpool, slot_idx);
       if (err)
         {
           /* Only reachable after prior timeouts left every slot marked.  */
           fprintf (stderr, "virtio-net: no free TX slot\n");
-          pthread_mutex_unlock (&d->tx_lock);
           return EAGAIN;
         }
     }
 
-  slot = virtio_pool_slot (&d->txpool, slot_idx);
+  slot = virtio_pool_slot (&d->txpool, *slot_idx);
   memcpy (slot + VNET_HDR_SIZE, frame, len);
 
-  buf.addr = virtio_pool_slot_phys (&d->txpool, slot_idx);
+  buf.addr = virtio_pool_slot_phys (&d->txpool, *slot_idx);
   buf.len = VNET_HDR_SIZE + len;
   buf.flags = 0;  /* the device reads header and frame */
+
+  if (arm_wait)
+    virtio_pool_arm_wait (&d->txpool, *slot_idx);
 
   /* Under EVENT_IDX the device notifies only while its last-notified
      index is at or below the published threshold, so every submission
@@ -227,7 +235,47 @@ vnet_dev_tx (struct vnet_dev *d, const void *frame, size_t len)
      would stop once the device passed the value published at init and
      every TX wait would fall back to its one-second timeout.  */
   virtio_queue_used_notify_always (&d->txq);
-  err = virtio_pool_submit (&d->txpool, &d->txq, slot_idx, &buf, 1, NULL);
+
+  err = virtio_pool_submit (&d->txpool, &d->txq, *slot_idx, &buf, 1, NULL);
+  if (err && arm_wait)
+    virtio_pool_disarm_wait (&d->txpool, *slot_idx);
+  return err;
+}
+
+error_t
+vnet_dev_tx (struct vnet_dev *d, const void *frame, size_t len)
+{
+  struct virtio_used_elem used;
+  uint16_t slot_idx;
+  error_t err;
+
+  if (__atomic_load_n (&d->stopping, __ATOMIC_SEQ_CST))
+    return EIO;
+
+  if (!vnet_tx_sync)
+    {
+      pthread_mutex_lock (&d->tx_lock);
+      err = vnet_tx_submit (d, frame, len, &slot_idx, 0);
+      if (err)
+        {
+          pthread_mutex_unlock (&d->tx_lock);
+          return err;
+        }
+      /* Counted at submit and under tx_lock: device_write RPCs are
+         served by concurrent libports threads.  The completion result
+         belongs to whichever later submitter reaps it; the slot stays
+         marked until then.  */
+      d->stats.tx_packets++;
+      d->stats.tx_bytes += len;
+      if (vnet_verbose)
+        fprintf (stderr, "virtio-net: TX %zu bytes queued (slot %u)\n",
+                 len, slot_idx);
+      pthread_mutex_unlock (&d->tx_lock);
+      return 0;
+    }
+
+  pthread_mutex_lock (&d->tx_lock);
+  err = vnet_tx_submit (d, frame, len, &slot_idx, 1);
   if (err)
     {
       /* Submission failed; slot was never marked in flight.  */
@@ -241,8 +289,8 @@ vnet_dev_tx (struct vnet_dev *d, const void *frame, size_t len)
      writers can pipeline their frames.  */
   pthread_mutex_unlock (&d->tx_lock);
 
-  err = virtio_pool_wait_slot (&d->txpool, &d->txq, slot_idx,
-                               VNET_TX_TIMEOUT, &used);
+  err = virtio_pool_wait_armed (&d->txpool, &d->txq, slot_idx,
+                                VNET_TX_TIMEOUT, &used);
   __atomic_fetch_sub (&d->tx_inflight, 1, __ATOMIC_SEQ_CST);
 
   pthread_mutex_lock (&d->tx_lock);
@@ -278,8 +326,10 @@ vnet_dev_quiesce (struct vnet_dev *d)
   pthread_mutex_lock (&d->txq.lock);
   pthread_cond_broadcast (&d->txq.cv);
   pthread_mutex_unlock (&d->txq.lock);
-  /* Wait for in-flight TX requests to finish (or time out) before freeing
-     DMA pools.  */
+  /* Wait for in-flight TX requests to finish (or time out) before
+     freeing DMA pools; synchronous-mode waiters only, since netdde-style
+     async frames have none, and their DMA is covered by the device
+     reset below happening before the pools are freed.  */
   for (i = 0; i < 20 && __atomic_load_n (&d->tx_inflight, __ATOMIC_SEQ_CST) > 0; i++)
     usleep (100000);
   /* Join the RX service thread before freeing the DMA pools: a completion

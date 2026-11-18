@@ -31,6 +31,7 @@ const char *argp_program_version = "virtio-net 0.1";
 
 int vnet_verbose;
 int vnet_event_idx;
+int vnet_tx_sync;
 
 /* Keys for the long-only options; 0 would not distinguish them.  */
 enum {
@@ -71,6 +72,9 @@ static const struct argp_option options[] =
   {"event-idx", OPT_EVENT_IDX, 0, 0,
    "Enable split-ring EVENT_IDX used-notification moderation on RX "
    "(budgeted polling with race-safe interrupt rearming; default off)"},
+  {"sync", 'S', 0, 0,
+   "Wait for each transmitted frame's backend completion (synchronous "
+   "TX); default is netdde-style fire-and-forget"},
   {"verbose", 'v', 0, 0,
    "Log deliveries, completions, and port activity"},
   {0}
@@ -105,6 +109,9 @@ parse_opt (int key, char *arg, struct argp_state *state)
     case OPT_EVENT_IDX:
       vnet_event_idx = 1;
       break;
+    case 'S':
+      vnet_tx_sync = 1;
+      break;
     default:
       return ARGP_ERR_UNKNOWN;
     }
@@ -116,7 +123,7 @@ static const struct argp argp =
 {
   options, parse_opt,
   "[--device=SLOT] [--selftest [--selftest-traffic]] [--status] "
-  "[--serve [--name=NAME]] [--verbose]",
+  "[--serve [--name=NAME]] [--sync] [--event-idx] [--verbose]",
   "Virtio network driver: raw Ethernet I/O on QEMU's virtio-net PCI "
   "device (0x1af4:0x1000), with the Mach net-device semantics layer and "
   "a Mach device translator mode for Hurd network stacks (pfinet/lwip)"
@@ -577,7 +584,7 @@ vnet_selftest (int traffic)
           "open/mode/range policy enforced\n");
   printf ("NET_RCV_MSG round trip: pfinet's filter installed, ARP frame "
           "delivered, filtered-out frame withheld\n");
-  printf ("raw TX of one %zu-byte ARP frame ok\n", sizeof arp);
+  printf ("raw TX of one %zu-byte ARP frame accepted\n", sizeof arp);
   {
     const struct vnet_stats *s = vnet_dev_stats (&vnet);
 

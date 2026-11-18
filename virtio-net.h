@@ -208,7 +208,9 @@ struct vnet_hurd {
   struct vnet_hurd *next;  /* registry of open handles, see rx_all */
 };
 
+/* virtio-net.c */
 extern int vnet_verbose;
+extern int vnet_tx_sync;
 
 /* RX used-notification moderation policy (--event-idx): when set, the
    driver also accepts the split-ring EVENT_IDX feature and runs the RX
@@ -232,8 +234,10 @@ void vnet_serve (struct vnet_dev *dev, const char *name);
 error_t vnet_dev_init (struct vnet_dev *, const char *override);
 void vnet_dev_quiesce (struct vnet_dev *);
 void vnet_dev_reread_config (struct vnet_dev *);
-/* Post one frame for TX and wait for its completion; on success the
-   frame is handed to the backend and *LEN bytes are consumed.  */
+/* Post one frame for TX.  Default is netdde-style fire-and-forget: the
+   frame is queued and its completion is reaped by a later submission;
+   with --sync the call waits for the backend completion.  On success
+   the frame is handed to the backend and the full length is accepted.  */
 error_t vnet_dev_tx (struct vnet_dev *, const void *frame, size_t len);
 const struct vnet_stats *vnet_dev_stats (struct vnet_dev *);
 int vnet_dev_link_up (struct vnet_dev *);

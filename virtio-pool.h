@@ -78,7 +78,9 @@ error_t virtio_pool_post_wait (struct virtio_slot_pool *p,
 
 /* Submit a slot without waiting for completion.  Caller must coordinate
    serialization (e.g. hold the driver submission lock).  Records the
-   completion state under the pool lock.  Returns 0 on success.  */
+   completion state under the pool lock.  Returns 0 on success.  The
+   chain is kicked only after its slot is registered, so a concurrent
+   reap can never observe an unregistered completion.  */
 error_t virtio_pool_submit (struct virtio_slot_pool *p,
                             struct virtio_queue *q, uint16_t slot,
                             const struct virtio_buf *bufs, uint16_t nbufs,
@@ -90,8 +92,30 @@ int virtio_pool_reap (struct virtio_slot_pool *p, struct virtio_queue *q);
 int virtio_pool_reap_locked (struct virtio_slot_pool *p,
                              struct virtio_queue *q);
 
-/* Wait for SLOT's completion (opportunistic reap).  Returns 0 on success
-   and fills *USED; ETIMEDOUT on timeout (slot stays in flight).  */
+/* Register a waiter for SLOT before its chain is submitted: a reap that
+   consumes the completion while the submitter is between submit and
+   wait then stores the result and signals the waiter instead of
+   discarding it.  Every arm pairs with exactly one
+   virtio_pool_wait_armed (on submission success) or
+   virtio_pool_disarm_wait (on failure).  */
+void virtio_pool_arm_wait (struct virtio_slot_pool *p, uint16_t slot);
+void virtio_pool_disarm_wait (struct virtio_slot_pool *p, uint16_t slot);
+
+/* Wait for an already-armed SLOT's completion (opportunistic reap).
+   Same contract as virtio_pool_wait_slot.  A completion consumed by
+   another thread's reap is still delivered through the stored result,
+   but the wakeup may then be missed (the IRQ handler narrows wakeups
+   by the queue's used index, which the reaper already advanced), in
+   which case the wait ends at its timeout or the next completion
+   interrupt on the queue.  */
+error_t virtio_pool_wait_armed (struct virtio_slot_pool *p,
+                                struct virtio_queue *q, uint16_t slot,
+                                int timeout_sec,
+                                struct virtio_used_elem *used);
+
+/* Arm and wait for SLOT's completion (opportunistic reap).  Returns 0
+   on success and fills *USED; ETIMEDOUT on timeout (slot stays in
+   flight).  */
 error_t virtio_pool_wait_slot (struct virtio_slot_pool *p,
                                struct virtio_queue *q, uint16_t slot,
                                int timeout_sec, struct virtio_used_elem *used);

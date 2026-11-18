@@ -132,7 +132,12 @@ virtio_pool_submit (struct virtio_slot_pool *p, struct virtio_queue *q,
   uint16_t head;
   error_t err;
 
-  err = virtio_queue_post_head (q, bufs, nbufs, &head);
+  /* Post without the kick and register the slot before kicking: the
+     device can complete a chain the moment it sees it, and a reap that
+     pops a completion with no registered head logs a foreign id,
+     latches pool_error_seq (failing every waiter with EIO) and leaks
+     the in-flight slot.  */
+  err = virtio_queue_post_head_deferred (q, bufs, nbufs, &head);
   if (err)
     return err;
 
@@ -142,6 +147,8 @@ virtio_pool_submit (struct virtio_slot_pool *p, struct virtio_queue *q,
   p->slot_done[slot] = 0;
   p->slot_error[slot] = 0;
   pthread_mutex_unlock (&p->lock);
+
+  virtio_queue_notify (q);
 
   if (head_out)
     *head_out = head;
@@ -222,10 +229,31 @@ virtio_pool_reap (struct virtio_slot_pool *p, struct virtio_queue *q)
   return r;
 }
 
+/* Register a waiter for SLOT before its chain is submitted: a reap
+   consuming the completion while the submitter is between submit and
+   wait then stores the result and signals the waiter instead of
+   discarding it.  Every arm pairs with exactly one wait_armed
+   (submission succeeded) or disarm_wait (submission failed).  */
+void
+virtio_pool_arm_wait (struct virtio_slot_pool *p, uint16_t slot)
+{
+  pthread_mutex_lock (&p->lock);
+  p->slot_waiters[slot]++;
+  pthread_mutex_unlock (&p->lock);
+}
+
+void
+virtio_pool_disarm_wait (struct virtio_slot_pool *p, uint16_t slot)
+{
+  pthread_mutex_lock (&p->lock);
+  p->slot_waiters[slot]--;
+  pthread_mutex_unlock (&p->lock);
+}
+
 error_t
-virtio_pool_wait_slot (struct virtio_slot_pool *p, struct virtio_queue *q,
-                       uint16_t slot, int timeout_sec,
-                       struct virtio_used_elem *used)
+virtio_pool_wait_armed (struct virtio_slot_pool *p, struct virtio_queue *q,
+                        uint16_t slot, int timeout_sec,
+                        struct virtio_used_elem *used)
 {
   struct timespec deadline;
   int werr;
@@ -235,7 +263,6 @@ virtio_pool_wait_slot (struct virtio_slot_pool *p, struct virtio_queue *q,
   deadline.tv_sec += timeout_sec;
 
   pthread_mutex_lock (&p->lock);
-  p->slot_waiters[slot]++;
   observed_seq = p->pool_error_seq;
   pthread_mutex_unlock (&p->lock);
 
@@ -287,4 +314,13 @@ virtio_pool_wait_slot (struct virtio_slot_pool *p, struct virtio_queue *q,
           return ETIMEDOUT;
         }
     }
+}
+
+error_t
+virtio_pool_wait_slot (struct virtio_slot_pool *p, struct virtio_queue *q,
+                       uint16_t slot, int timeout_sec,
+                       struct virtio_used_elem *used)
+{
+  virtio_pool_arm_wait (p, slot);
+  return virtio_pool_wait_armed (p, q, slot, timeout_sec, used);
 }
