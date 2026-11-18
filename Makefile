@@ -128,8 +128,9 @@ vnetNotifyServer.c vnet-notify_S.h: vnet-notify.sdefsi
 	$(MIG) $(MIGCOMFLAGS) -sheader vnet-notify_S.h \
 	    -server vnetNotifyServer.c -user /dev/null -header /dev/null $<
 
-%.o: %.c virtio-pci.h virtio-queue.h virtio-9p.h virtio-balloon.h \
-     virtio-blk.h virtio-blk-serve.h virtio-net.h
+%.o: %.c virtio-pci.h virtio-queue.h virtio-pool.h virtio-9p.h \
+     virtio-balloon.h virtio-blk.h virtio-blk-serve.h virtio-net.h \
+     virtio-serve.h
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -c $< -o $@
 
 # The MIG stubs include "vnet-device_S.h"/"vnet-notify_S.h" (generated
