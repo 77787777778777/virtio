@@ -2,14 +2,16 @@
 
    RX: one contiguous DMA region of `hdr + frame cap` buffers, all posted
    to receiveq as single F_WRITE descriptors at init and replenished after
-   every completion (plan §4.3/§6.4).  One buffer per frame is enough
+   every completion.  One buffer per frame is enough
    without MRG_RXBUF: QEMU refuses to deliver a frame that does not fit
    the posted buffer, which the length validation below counts as a drop.
 
    TX: one contiguous DMA region of `hdr + frame cap` slots.  Submission
-   is serialized under tx_lock (slots bound the in-flight frames; a slot
-   whose completion timed out stays marked so the device can never race
-   a reused buffer), exactly the vblk_req_one discipline.
+   is serialized under tx_lock, but the lock is released before waiting
+   for completion so writers can pipeline frames; the slot count bounds
+   the in-flight frames.  A slot whose completion timed out stays marked
+   so the device can never race a reused buffer, exactly the vblk_req_one
+   discipline.
 
    Completion mapping: the used entry's id is the chain's head descriptor
    index; desc2slot/head2slot tables translate it back to a pool slot, so
@@ -129,11 +131,13 @@ vnet_buf_release (struct vnet_dev *d)
 }
 
 /* Consume one RX completion, validate it against the pool, and hand the
-   Ethernet frame (after the virtio-net header) to the Hurd layer.  The
-   buffer is always reposted, on every path, so the queue never drains.
-   NOTIFY selects the legacy per-buffer kick (callers that post one
-   buffer per wait) or a deferred kick the caller issues once per
-   polling pass.  */
+   Ethernet frame (after the virtio-net header) to the Hurd layer.  Posted
+   buffers are reposted on every valid path; a completion whose id is not
+   a posted buffer returns without reposting (counted as a bad completion),
+   and a persistent replenish failure defers the slot.  So the queue never
+   drains for posted buffers.  NOTIFY selects the legacy per-buffer kick
+   (callers that post one buffer per wait) or a deferred kick the caller
+   issues once per polling pass.  */
 static void
 vnet_rx_one (struct vnet_dev *d, struct virtio_used_elem *used, int notify)
 {
@@ -154,7 +158,7 @@ vnet_rx_one (struct vnet_dev *d, struct virtio_used_elem *used, int notify)
 
   /* QEMU writes used.len = bytes written (header + frame); anything else
      is malformed and dropped, but the buffer still goes back to the
-     queue (plan §4.3 completion validation).  */
+     queue.  */
   if (used->len < VNET_HDR_SIZE || used->len > d->rx_buf_size)
     {
       if (vnet_verbose)
@@ -305,8 +309,7 @@ vnet_buf_rx_legacy_once (struct vnet_dev *d)
 }
 
 /* One moderated-path iteration (EVENT_IDX enabled, the
-   publish -> barrier -> recheck -> sleep discipline of
-   stuff/napi_plan.md section 5.5).  Drains up to VNET_RX_POLL_BUDGET
+   publish -> barrier -> recheck -> sleep discipline).  Drains up to VNET_RX_POLL_BUDGET
    completions without blocking; only when the queue runs dry does it
    recover, arm the next-completion interrupt, recheck for the arm race,
    and sleep on the queue condvar.  The rearm recheck is what makes the

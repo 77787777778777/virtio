@@ -5,11 +5,11 @@
    DEVICE_IMPORTS mutation in vnet-mutate.h, and translate every
    device_t argument through begin_using_device_port/payload /
    end_using_device — the same shape as libmachdev's mig-decls.h and the
-   virtio-blk Stage C server.
+   virtio-blk server.
 
    A handle is a libports port (in virtio_serve_bucket, class
    virtio_serve_class) whose struct begins with struct port_info; the
-   rest is the plan's §5 Mach semantics layer (virtio-net-hurd.c) plus
+   rest is the Mach semantics layer (virtio-net-hurd.c) plus
    the name the device_open arrived with, for logging.  */
 
 #ifndef VIRTIO_NET_SERVE_H

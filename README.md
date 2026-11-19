@@ -232,8 +232,8 @@ head, so in-flight concurrency can be added without changing the
 completion path.
 
 Field layouts, feature bits, and request/status values follow QEMU's
-`include/standard-headers/linux/virtio_blk.h` (the guest-visible contract,
-cited with anchors in `stuff/virtio_disk_plan.md` §4); the Mach RPC shapes
+`include/standard-headers/linux/virtio_blk.h` (the guest-visible contract);
+the Mach RPC shapes
 and `D_*` codes follow gnumach's `include/device/device.defs` and
 `include/device/device_types.h`, with `hurd/libstore/device.c` as the
 consumer baseline; the virtio specification's legacy PCI transport and
@@ -335,20 +335,19 @@ port dies. TX submissions are serialized under one lock and the pool's
 slot count bounds the frames in flight (netdde-style fire-and-forget by
 default, wait-for-completion with `--sync`), completions are
 validated by descriptor-head-to-slot map, and RX bad completions are
-counted and dropped with the buffer always reposted, so the queue never
-starves. Frame delivery builds the `net_rcv_msg` exactly as
+counted and dropped with posted buffers reposted on every valid path,
+so the queue never starves for posted buffers. Frame delivery builds the `net_rcv_msg` exactly as
 eth-multiplexer's broadcast path does (packed size, rounded msgh_size,
 packet length including the 4-byte prefix, `COPY_SEND` right, deallocate
 on refused delivery).
 
 The Mach RPC shapes and `D_*` codes follow gnumach's
 `include/device/device.defs`, with `hurd/pfinet/ethernet.c` and
-`hurd/eth-multiplexer` as the consumer baselines (cited with anchors in
-`stuff/virtio_network_plan.md`); the virtio specification's legacy PCI
-transport and Network Device sections arbitrate any disagreement. The
-QEMU runtime bring-up (S2–S6 in the plan: interrupt delivery, link-status
-change, external traffic, pfinet attach) is still pending — everything
-above is compile- and in-process-verified only.
+`hurd/eth-multiplexer` as the consumer baselines; the virtio specification's legacy PCI
+transport and Network Device sections arbitrate any disagreement. QEMU
+runtime bring-up (interrupt delivery, link-status change, external
+traffic, and stack attach) is still pending — everything above is
+compile- and in-process-verified only.
 
 ## Why not NetBSD's vio9p
 

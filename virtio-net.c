@@ -2,13 +2,13 @@
 
    A standalone long-lived daemon like virtio-blk: the MVP has no device
    node unless started with --serve, which turns the process into the
-   Mach device translator pfinet/lwip open through file_name_lookup +
-   device_open.  Without --serve the daemon owns the device, services
+   Mach device translator that network stacks open through file_name_lookup
+   + device_open.  Without --serve the daemon owns the device, services
    the receive queue, logs config changes and counters, and proves the
    datapath: --selftest drives the handshake, the Mach device semantics
    layer, and an in-process NET_RCV_MSG construction/delivery round trip
    (filter evaluation plus a real mach_msg send/receive on a private
-   port, so the whole §5.2 message path is exercised without a stack).
+   port, so the whole message path is exercised without a stack).
    --selftest-traffic additionally proves raw TX/RX against the backend.
    Every exit path is clean: a guest booted without a virtio-net device
    must produce a diagnostic, not a hang.  */
@@ -132,7 +132,7 @@ static const struct argp argp =
   "[--serve [--name=NAME]] [--sync] [--event-idx] [--no-event-idx] [--verbose]",
   "Virtio network driver: raw Ethernet I/O on QEMU's virtio-net PCI "
   "device (0x1af4:0x1000), with the Mach net-device semantics layer and "
-  "a Mach device translator mode for Hurd network stacks (pfinet/lwip)"
+  "a Mach device translator mode for Hurd network stacks"
 };
 
 static struct vnet_dev vnet;
@@ -215,7 +215,7 @@ selftest_arp_frame (struct vnet_dev *d, uint8_t *f)
    receive port, push a synthetic ARP frame through the delivery path,
    and receive the message back, validating everything a stack demuxer
    checks: msgh_id, local-port matching, and the header/payload/count
-   layout of §5.2.  */
+   layout of the message path.  */
 static error_t
 selftest_rcv_msg (struct vnet_hurd *h)
 {
@@ -325,7 +325,7 @@ selftest_rcv_msg (struct vnet_hurd *h)
   return err;
 }
 
-/* Environment-dependent raw datapath proof (plan §6.5): send an ARP
+/* Environment-dependent raw datapath proof: send an ARP
    request and let the RX thread watch for any backend reply.  With
    slirp, the gateway answers ARP for 10.0.2.2; with other backends the
    result depends on the environment, so a timeout is reported, not
@@ -676,9 +676,9 @@ main (int argc, char **argv)
 
   if (opt_serve)
     {
-      /* Stage B: become the Mach device translator.  Bring-up failure
-         is fatal before trivfs_startup replies to the parent, so
-         settrans reports it instead of hanging on a dead node.  */
+      /* Become the Mach device translator.  Bring-up failure is fatal
+         before trivfs_startup replies to the parent, so settrans
+         reports it instead of hanging on a dead node.  */
       err = vnet_start_device (opt_device);
       if (err)
         error (4, err, "virtio-net device not usable");

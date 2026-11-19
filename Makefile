@@ -17,8 +17,8 @@ TRANSPORT = virtio-pci.o virtio-queue.o
 LIBS = shouldbeinlibc ihash ports iohelp fshelp trivfs pciaccess \
        hurduser machuser irqhelp
 LIBS_DAEMON = shouldbeinlibc pciaccess machuser irqhelp
-# virtio-blk links the trivfs/ports stack too since Stage C: the binary
-# doubles as the Mach device translator (`--serve`).
+# virtio-blk links the trivfs/ports stack too: the binary doubles as the
+# Mach device translator (`--serve`).
 LIBS_BLK = shouldbeinlibc ihash ports iohelp fshelp trivfs pciaccess \
            hurduser machuser irqhelp
 # vblk-client is a plain RPC client: file_name_lookup (hurduser),

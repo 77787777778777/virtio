@@ -9,13 +9,12 @@
    only bound-checked, because QEMU's virtio-blk reports the pushed length
    rather than a byte count the driver needs.
 
-   The engine is serialized: one chain outstanding at a time, which is the
-   MVP concurrency policy (plan R6).  Completion lookup is still by
-   descriptor head through head2slot, so the table stays correct if
-   several chains are ever posted concurrently.  A request whose wait
-   times out keeps its slot marked: the chain is still device-owned, so
-   the buffers cannot be reused, and its used entry is discarded by the
-   next waiter instead of failing a live request.  */
+   The engine is serialized: one chain outstanding at a time (MVP policy).
+   Completion lookup is still by descriptor head through head2slot.  A
+   request whose wait times out keeps its slot marked: the chain is
+   still device-owned, so the buffers cannot be reused, and its used
+   entry is discarded by the next waiter instead of failing a live
+   request.  */
 
 #include <errno.h>
 #include <stdio.h>
@@ -40,9 +39,9 @@ vblk_req_release (struct vblk_dev *d)
 }
 
 /* Build, post, and await one chain under the dev-level request mutex:
-   serve-mode RPCs arrive on concurrent libports worker threads, and the
-   pool engine has no internal locking, so the one-chain-in-flight
-   policy is enforced here (virtio-blk.h req_lock).  DATA_LEN 0 means
+   the server runs one thread (ports_manage_port_operations_one_thread),
+   so RPCs are not concurrent; the lock still enforces the one-chain-in-flight
+   policy here (virtio-blk.h req_lock).  DATA_LEN 0 means
    the request type carries no data buffer (flush).  DATA is the
    caller's buffer: for a write it is copied into the slot before
    posting, for a read it is filled from the slot after the status is

@@ -1,6 +1,6 @@
 /* virtio-blk device engine: probe, feature negotiation, config, queue.
 
-   Legacy PCI policy per the plan's MVP: probe 0x1af4:0x1001, reset/ACK/
+   Legacy PCI MVP policy: probe 0x1af4:0x1001, reset/ACK/
    DRIVER, accept exactly the implemented feature bits (each has matching
    behavior, so the accepted mask is not wishful), program requestq 0,
    read the negotiated config, reach DRIVER_OK, and service queue and

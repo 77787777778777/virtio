@@ -71,7 +71,7 @@ struct virtio_queue {
      used_event once the feature is accepted, because the device
      interprets the field the moment the feature bit is set.  avail_event
      is the device's kick threshold, read-only here (kick suppression is
-     deliberately not implemented; see stuff/napi_plan.md Phase 3).  */
+     deliberately not implemented).  */
   volatile uint16_t *avail_flags;
   volatile uint16_t *used_event;
   volatile const uint16_t *avail_event;
@@ -138,8 +138,7 @@ error_t virtio_queue_try_pop_used (struct virtio_queue *,
                                    struct virtio_used_elem *);
 
 
-/* Used-notification moderation over split EVENT_IDX (design and race
-   rules in stuff/napi_plan.md): the device interrupts when the used
+/* Used-notification moderation over split EVENT_IDX: the device interrupts when the used
    index passes the published threshold, so arming at the consumed
    position yields exactly one interrupt for the next completion, and
    sleeping on the queue condvar is safe only after that publish, a

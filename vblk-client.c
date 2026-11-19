@@ -1,11 +1,11 @@
 /* vblk-client: direct Mach device RPC harness client for virtio-blk.
 
-   The plan's S3 spike asks for "a small Mach/libstore client ... exercising
-   size query, sector reads, and disposable writes/flush"; this is that
-   client.  It bypasses libstore on purpose: storeio maps D_* errors
-   through dev_error into errnos (hurd/libstore/device.c), which would
-   lose the exact codes the semantics layer is supposed to return, while
-   this client asserts them raw off the RPCs.
+   This client exercises size query, sector reads, and disposable
+   writes/flush directly over the Mach device RPCs.  It bypasses libstore
+   on purpose: storeio maps D_* errors through dev_error into errnos
+   (hurd/libstore/device.c), which would lose the exact codes the
+   semantics layer is supposed to return, while this client asserts them
+   raw off the RPCs.
 
    Usage (NODE is a translator node published by `virtio-blk --serve`):
 
@@ -271,7 +271,7 @@ expect (const char *what, error_t got, error_t want)
   return got == want ? 0 : 1;
 }
 
-/* The negative half of the plan's §5.1.1 baseline, exercised through
+/* The negative half of the baseline, exercised through
    real RPCs: bounds, alignment, unknown flavors, the unimplemented
    surface, and read-only refusal.  */
 static int

@@ -1,6 +1,6 @@
 /*
  * virtio-net-serve.c - MIG device handlers and vtable for the
- * virtio-net driver (plan Stage B, D3/S2/S3).
+ * virtio-net driver.
  *
  * The translator scaffold (trivfs node, demuxer, notify plumbing,
  * port lifetime, goaway) lives in the shared virtio-serve.c; this file
@@ -14,7 +14,7 @@
  *     instead of block I/O);
  *   - subsequent ds_device_write/set_filter/get_status calls resolve
  *     that port back to the handle via the DEVICE_* MIG mutations in
- *     vnet-mutate.h, and run the plan's §5 semantics through
+ *     vnet-mutate.h, and run the semantics through
  *     virtio-net-hurd.c;
  *   - filters registered by a client are removed by the dead-name
  *     notification requested at set_filter time (the ports_dead_name
@@ -196,7 +196,7 @@ ds_device_read (vnet_port_t device, mach_port_t reply_port,
   *data = (io_buf_ptr_t) 0;
   *datalen = 0;
   /* Inbound frames arrive as NET_RCV_MSG on the filter-registered
-     receive port, never through device_read (plan §5.1.1).  */
+     receive port, never through device_read.  */
   return D_INVALID_OPERATION;
 }
 

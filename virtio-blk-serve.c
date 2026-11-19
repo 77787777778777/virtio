@@ -1,6 +1,6 @@
 /*
  * virtio-blk-serve.c - MIG device handlers and vtable for the
- * virtio-blk driver (plan Stage C, D3/S2/S3).
+ * virtio-blk driver.
  *
  * The translator scaffold (trivfs node, demuxer, notify plumbing, port
  * lifetime, goaway) lives in the shared virtio-serve.c; this file
@@ -14,7 +14,7 @@
  *     of forwarding to the kernel);
  *   - subsequent ds_device_read/write/get_status calls resolve that
  *     port back to the handle via the DEVICE_* MIG mutations in
- *     mig-mutate.h, and run the plan's §5.1.1/§5.5 semantics through
+ *     mig-mutate.h, and run the semantics through
  *     virtio-blk-hurd.c.
  *
  * MIG stubs are generated from the cross prefix's

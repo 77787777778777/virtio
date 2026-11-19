@@ -8,13 +8,13 @@
    stale-completion discipline both drivers rely on: a chain whose wait
    timed out keeps its slot marked, so the device can never race a reused
    buffer, and its used entry is consumed and discarded by whichever
-   request waits next (plan blk §4.2 / net §4.3 completion validation).
+   request waits next (completion validation).
 
    The pool's own lock (with the arm/wait machinery below) guards the
    slot tables and completion state, so a completion reaped by one
    thread is delivered to another thread's registered waiter; drivers
    still serialize submission themselves (net holds tx_lock, blk
-   req_lock) to bound which slots are handed out concurrently.  */
+   req_lock) to bound slot handout and submission.  */
 
 #ifndef VIRTIO_POOL_H
 #define VIRTIO_POOL_H
@@ -82,8 +82,8 @@ error_t virtio_pool_post_wait (struct virtio_slot_pool *p,
 /* Submit a slot without waiting for completion.  Caller must coordinate
    serialization (e.g. hold the driver submission lock).  Records the
    completion state under the pool lock.  Returns 0 on success.  The
-   chain is kicked only after its slot is registered, so a concurrent
-   reap can never observe an unregistered completion.  */
+   chain is kicked only after its slot is registered, so a reap can
+   never observe an unregistered completion.  */
 error_t virtio_pool_submit (struct virtio_slot_pool *p,
                             struct virtio_queue *q, uint16_t slot,
                             const struct virtio_buf *bufs, uint16_t nbufs,

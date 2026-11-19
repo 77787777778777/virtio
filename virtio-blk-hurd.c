@@ -1,8 +1,7 @@
 /* virtio-blk Hurd integration: the Mach device semantics layer.
 
-   This module implements the plan's source-resolved MVP subset of the
-   Mach block-device contract (stuff/virtio_disk_plan.md §5.1.1/§5.5) on
-   top of the raw request engine, so the units, status flavors, and error
+   This module implements the MVP subset of the
+   Mach block-device contract on top of the raw request
    codes libstore/storeio expect are fixed and testable before any port
    publication exists:
 
@@ -20,10 +19,7 @@
      flavors/modes to D_INVALID_OPERATION instead of crashing.
 
    What is deliberately absent: the MIG demuxer, port set, and name
-   publication.  Plan decisions D1-D3 (open model, naming, privileges)
-   are gated on the S2/S3 runtime spikes, so the ds_device_* entry points
-   land with that work; the functions here are exactly what those
-   handlers will call.  */
+   publication (virtio-blk-serve.c).  */
 
 #include <errno.h>
 #include <limits.h>
@@ -60,7 +56,7 @@ vblk_hurd_init (struct vblk_hurd *h, struct vblk_dev *d)
   /* Round the extent down to whole records so DEV_GET_SIZE and
      DEV_GET_RECORDS agree exactly (size == records * record_size); a
      capacity that is not a whole number of records is truncated, the
-     same policy the plan's MVP baseline states.  */
+     same MVP baseline policy.  */
   h->records = d->size_bytes / h->record_size;
   h->size_bytes = h->records * h->record_size;
 
@@ -242,8 +238,7 @@ vblk_hurd_write (struct vblk_hurd *h, int mode, recnum_t recnum,
 
 /* Inband carries at most IO_INBAND_MAX (128) bytes, far below any block
    transfer; map is unused by the MVP consumers.  Answer with the
-   compatible error rather than crashing, per the plan's defensive
-   baseline.  */
+   compatible error rather than crashing.  */
 error_t
 vblk_hurd_read_inband (struct vblk_hurd *h, int mode, recnum_t recnum,
                        int bytes_wanted, io_buf_ptr_inband_t data)

@@ -1,6 +1,6 @@
 /* virtio-net Hurd integration: the Mach network-device semantics layer.
 
-   This module implements the plan's §5.5 MVP subset of the Mach net-device
+   This module implements the MVP subset of the Mach net-device
    contract on top of the raw datapath, so the open/write/status/filter
    behaviors pfinet and lwip expect are fixed and testable before any port
    publication exists:
@@ -20,7 +20,7 @@
      (vdev.c broadcast_pack/deliver_msg): packet_header prefix, packet_type
      count, msgh_size rounded to uintptr_t, COPY_SEND remote port, and a
      zero-timeout send that drops on queue pressure instead of blocking
-     the RX thread (plan §6.3).
+     the RX thread.
 
    What is deliberately absent: the MIG demuxer, port set, and name
    publication (virtio-net-serve.c).  */
@@ -167,8 +167,8 @@ vnet_hurd_write (struct vnet_hurd *h, int mode, recnum_t recnum,
       *bytes_written = bytes;
       return 0;
     case EAGAIN:
-      /* D_NOWAIT semantics: the queues are full, do not hang the caller
-         (plan §5.1.1); pfinet/lwip retry on their own reopen logic.  */
+      /* D_NOWAIT semantics: the queues are full, do not hang the caller;
+         the caller should retry the write.  */
       return D_WOULD_BLOCK;
     case ETIMEDOUT:
     case EIO:
@@ -254,7 +254,7 @@ vnet_hurd_set_status (struct vnet_hurd *h, dev_flavor_t flavor,
     case NET_FLAGS:
       if (count != 1)
         return D_INVALID_SIZE;
-      /* Accept and record the interface flags (plan §5.5.1): the driver
+      /* Accept and record the interface flags: the driver
          delivers everything the backend sends and applies no semantic
          behavior to the bits, which is the compatibility surface the
          inspected stacks rely on.  */
@@ -264,7 +264,7 @@ vnet_hurd_set_status (struct vnet_hurd *h, dev_flavor_t flavor,
       h->if_flags = status[0];
       return 0;
     case NET_STATUS:
-      /* Not observed from pfinet/lwip; refusing keeps the flags store the
+      /* Unobserved in the inspected stacks; refusing keeps the flags store the
          single source of truth.  */
       fprintf (stderr, "virtio-net: set_status: NET_STATUS not supported\n");
       return D_INVALID_OPERATION;
@@ -490,7 +490,7 @@ vnet_hurd_rx_all (struct vnet_dev *dev, const char *frame, size_t frame_len)
 
 /* Inband carries at most IO_INBAND_MAX (128) bytes and map is unused by
    the MVP consumers; answer with the compatible error rather than
-   crashing, per the plan's defensive baseline.  */
+   crashing.  */
 error_t
 vnet_hurd_read_inband (struct vnet_hurd *h, int mode, recnum_t recnum,
                        int bytes_wanted, io_buf_ptr_inband_t data)

@@ -14,13 +14,11 @@
 
    The Hurd-facing layer (virtio-blk-hurd.c) maps Mach device semantics
    (recnum in records of record_size, DEV_GET_SIZE/DEV_GET_RECORDS, the D_*
-   errors) onto those 512-byte-sector virtio operations; the MIG port
-   publication/open model on top of it is the staged spike work (plan D1-D3,
-   S2/S3), so this module exposes the RPC subset's semantics as functions
-   the selftest drives directly.
+   errors) onto those 512-byte-sector virtio operations; this module
+   exposes the RPC subset's semantics as functions the selftest drives
+   directly.
 
-   Authoritative references (full citations with anchors in
-   stuff/virtio_disk_plan.md §4 and §5):
+   Authoritative references (full citations with anchors):
    - QEMU include/standard-headers/linux/virtio_blk.h: feature bits,
      struct virtio_blk_config field order, virtio_blk_outhdr, the T_*
      request types and S_* status values.
@@ -138,20 +136,20 @@ struct vblk_dev {
      region of VBLK_MAX_REQ slots plus the head-descriptor-to-slot map
      completions are validated against, with the stale-completion
      discard discipline).  The pool has no internal locking, and
-     serve-mode RPCs arrive on concurrent libports worker threads, so
-     req_lock enforces the one-chain-in-flight policy across alloc,
-     post and completion wait (the net driver's tx_lock discipline).  */
+     serve-mode RPCs run on a single thread, so req_lock enforces
+     the one-chain-in-flight policy across alloc, post and completion
+     wait (the net driver's tx_lock discipline).  */
   struct virtio_slot_pool reqs;
   pthread_mutex_t req_lock;
 
   struct vblk_stats stats;
 };
 
-/* The Mach device semantics layer: the plan's §5.1.1/§5.5 MVP subset
+/* The Mach device semantics layer: the MVP subset
    (open/close, read/write with recnum/record_size units, get_status for
    DEV_GET_SIZE/DEV_GET_RECORDS, set_status for DEV_FLUSH_CACHE, and the
    D_* error mapping), without the port publication/MIG demux that the
-   S2/S3 spikes must settle.  */
+   serve layer adds.  */
 struct vblk_hurd {
   struct vblk_dev *dev;
   int opened;
@@ -169,7 +167,7 @@ void vblk_stop_device (void);
 error_t vblk_selftest (int write_test);
 error_t vblk_status (const char *override);
 
-/* virtio-blk-serve.c: MIG device server / trivfs translator (Stage C).
+/* virtio-blk-serve.c: MIG device server / trivfs translator.
    Brings up no device itself: DEV must be initialized already.  Never
    returns; exits when trivfs_goaway tears the translator down.  */
 void vblk_serve (struct vblk_dev *dev, const char *name);

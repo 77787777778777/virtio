@@ -8,7 +8,7 @@
 
    A handle is a libports port (in virtio_serve_bucket, class
    virtio_serve_class) whose struct begins with struct port_info; the
-   rest is the plan's §5.1.1/§5.5 semantics layer (virtio-blk-hurd.c)
+   rest is the semantics layer (virtio-blk-hurd.c)
    plus the name the device_open arrived with, for logging.  */
 
 #ifndef VIRTIO_BLK_SERVE_H

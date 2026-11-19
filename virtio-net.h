@@ -11,16 +11,16 @@
    feature set, config offsets, queue roles, the RX/TX buffer pools, and
    the Hurd-facing Mach device layer.
 
-   The Hurd layer (virtio-net-hurd.c) implements the plan's §5.5 MVP
-   subset of the Mach network-device contract on top of the raw datapath:
+  The Hurd layer (virtio-net-hurd.c) implements the MVP
+  subset of the Mach network-device contract on top of the raw datapath:
    device_open/close/write, NET_STATUS/NET_ADDRESS/NET_FLAGS, real BPF
    filter evaluation through the pinned Hurd tree's libbpf (the same
    substrate eth-multiplexer uses), and NET_RCV_MSG delivery built and
    sent from userspace exactly like eth-multiplexer's vdev.c.  The MIG
    port publication lives in virtio-net-serve.c.
 
-   Authoritative references (citations in stuff/virtio_network_plan.md):
-   - QEMU include/standard-headers/linux/virtio_net.h: feature bits,
+  Authoritative references:
+  - QEMU include/standard-headers/linux/virtio_net.h: feature bits,
      struct virtio_net_config, the legacy 10-byte header, GSO_NONE.
    - QEMU hw/net/virtio-net.c: RX used.len is the bytes the device wrote
      (header + frame); TX completions are pushed with used.len = 0.
@@ -84,7 +84,7 @@
 
 /* Ethernet geometry: a 14-byte header, a 60-byte minimum frame, and a
    frame cap that covers 1514-byte untagged and 1518-byte VLAN-tagged
-   frames (plan §4.3 RX_FRAME_CAP).  */
+   frames (RX_FRAME_CAP).  */
 #define VNET_ETHER_HDR_SIZE  14
 #define VNET_ETHER_MIN_FRAME 60
 #define VNET_FRAME_CAP       1522
@@ -118,7 +118,7 @@
 
 /* Completions consumed per polling pass in EVENT_IDX mode before the RX
    thread stops suppressing interrupts, recovers retired slots, rearms
-   and sleeps (stuff/napi_plan.md section 5.5).  */
+   and sleeps.  */
 #define VNET_RX_POLL_BUDGET 64
 
 /* How long --selftest-traffic waits for a backend reply (seconds).  */
@@ -194,7 +194,7 @@ struct vnet_dev {
   struct vnet_stats stats;
 };
 
-/* The Mach device semantics layer: the plan's §5.5 MVP subset (open/close,
+/* The Mach device semantics layer: the MVP subset (open/close,
    device_write TX, NET_STATUS/NET_ADDRESS/NET_FLAGS, BPF filter install and
    evaluation, NET_RCV_MSG delivery), without the MIG demux/port publication
    that virtio-net-serve.c adds.  One instance per device_open handle.  */

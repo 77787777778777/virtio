@@ -1,11 +1,10 @@
 /* virtio-blk driver: main, argp, lifecycle, selftest.
 
-   A standalone long-lived daemon like virtio-balloon: the MVP has no
-   device node yet, because the port publication/open model (plan D1-D3)
-   waits on the S2/S3 spikes.  Until then the daemon exists to own the
-   device, log config changes and counters, and prove the datapath:
-   --selftest drives raw read/write/flush plus the Mach device semantics
-   layer, so the whole pipeline except name publication is exercised.
+   A standalone long-lived daemon like virtio-balloon: started with
+   --serve it becomes the Mach device translator for the block device;
+   without --serve it owns the device, logs config changes and counters,
+   and proves the datapath.  --selftest drives raw read/write/flush plus
+   the Mach device semantics layer, so the whole pipeline is exercised.
    Every exit path is clean: a guest booted without a virtio-blk device
    must produce a diagnostic, not a hang.  */
 
@@ -456,9 +455,8 @@ vblk_selftest (int write_test)
       fprintf (stderr, "virtio-blk selftest: unknown set_status accepted\n");
       return EIO;
     }
-  /* The inband/map surface is refused rather than crash-prone, per the
-     plan's defensive baseline (R13); IO_INBAND_MAX (128 bytes) could
-     never carry block data anyway.  */
+  /* The inband/map surface is refused rather than crash-prone;
+     IO_INBAND_MAX (128 bytes) could never carry block data anyway.  */
   if (vblk_hurd_read_inband (&h, 0, 0, 0, NULL) != D_INVALID_OPERATION
       || vblk_hurd_write_inband (&h, 0, 0, NULL, 0, &i) != D_INVALID_OPERATION)
     {
@@ -598,9 +596,9 @@ main (int argc, char **argv)
 
   if (opt_serve)
     {
-      /* Stage C: become the Mach device translator.  Bring-up failure
-         is fatal before trivfs_startup replies to the parent, so
-         settrans reports it instead of hanging on a dead node.  */
+      /* Become the Mach device translator.  Bring-up failure is fatal
+         before trivfs_startup replies to the parent, so settrans
+         reports it instead of hanging on a dead node.  */
       err = vblk_start_device (opt_device);
       if (err)
         error (4, err, "virtio-blk device not usable");

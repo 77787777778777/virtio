@@ -1,9 +1,9 @@
 /* virtio-net device engine: probe, feature negotiation, config, queues.
 
-   Legacy PCI policy per the plan's MVP: probe 0x1af4:0x1000, reset/ACK/
+   Legacy PCI MVP policy: probe 0x1af4:0x1000, reset/ACK/
    DRIVER, accept exactly the implemented feature bits (MAC is required:
-   without it the driver would have to invent an address, and the plan's
-   §4.2 rule is to fail explicitly instead), program rxq 0 / txq 1, read
+   without it the driver would have to invent an address, and the MVP
+   rule is to fail explicitly instead), program rxq 0 / txq 1, read
    the negotiated config, reach DRIVER_OK, and service queue and
    config-change interrupts through the transport's IRQ core.
 
@@ -178,7 +178,9 @@ vnet_dev_link_up (struct vnet_dev *d)
 }
 
 /* Build and post one TX chain: [zeroed 10-byte legacy header] [frame],
-   both device-readable.  Submission is serialized under tx_lock; a slot
+   both device-readable.  Submission is serialized under tx_lock; the
+   lock is released before waiting for completion so writers can pipeline
+   frames (slot count, not tx_lock, bounds the in-flight frames).  A slot
    whose wait timed out stays marked so the device can never race a
    reused buffer.  Default is netdde-style fire-and-forget: the frame is
    queued and later submissions reap its completion, so the slot count
@@ -191,10 +193,10 @@ vnet_dev_link_up (struct vnet_dev *d)
 
 /* The submit half, under tx_lock: reap finished completions, take a
    slot, copy the frame in, and submit.  ARM_WAIT registers the
-   completion waiter before submission so a concurrent submitter's reap
-   cannot consume this chain's completion in the window before the
-   waiter starts waiting (the reap would discard the result and stall
-   this writer until its timeout).  */
+   completion waiter before submission so a later reap cannot consume
+   this chain's completion in the window before the waiter starts
+   waiting (the reap would discard the result and stall this writer
+   until its timeout).  */
 static error_t
 vnet_tx_submit (struct vnet_dev *d, const void *frame, size_t len,
                 uint16_t *slot_idx, int arm_wait)
@@ -266,8 +268,7 @@ vnet_dev_tx (struct vnet_dev *d, const void *frame, size_t len)
           pthread_mutex_unlock (&d->tx_lock);
           return err;
         }
-      /* Counted at submit and under tx_lock: device_write RPCs are
-         served by concurrent libports threads.  The completion result
+      /* Counted at submit and under tx_lock.  The completion result
          belongs to whichever later submitter reaps it; the slot stays
          marked until then.  */
       d->stats.tx_packets++;
