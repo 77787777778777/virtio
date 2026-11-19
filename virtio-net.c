@@ -30,7 +30,7 @@
 const char *argp_program_version = "virtio-net 0.1";
 
 int vnet_verbose;
-int vnet_event_idx;
+int vnet_event_idx = 1;
 int vnet_tx_sync;
 
 /* Keys for the long-only options; 0 would not distinguish them.  */
@@ -39,7 +39,8 @@ enum {
   OPT_TRAFFIC,
   OPT_SERVE,
   OPT_NAME,
-  OPT_EVENT_IDX
+  OPT_EVENT_IDX,
+  OPT_NO_EVENT_IDX
 };
 
 static const char *opt_device;
@@ -71,7 +72,9 @@ static const struct argp_option options[] =
    "any, including the \"eth\" name pfinet opens with)"},
   {"event-idx", OPT_EVENT_IDX, 0, 0,
    "Enable split-ring EVENT_IDX used-notification moderation on RX "
-   "(budgeted polling with race-safe interrupt rearming; default off)"},
+   "(budgeted polling with race-safe interrupt rearming; on by default)"},
+  {"no-event-idx", OPT_NO_EVENT_IDX, 0, 0,
+   "Disable RX EVENT_IDX moderation (legacy one-interrupt-per-packet path)"},
   {"sync", 'S', 0, 0,
    "Wait for each transmitted frame's backend completion (synchronous "
    "TX); default is netdde-style fire-and-forget"},
@@ -109,6 +112,9 @@ parse_opt (int key, char *arg, struct argp_state *state)
     case OPT_EVENT_IDX:
       vnet_event_idx = 1;
       break;
+    case OPT_NO_EVENT_IDX:
+      vnet_event_idx = 0;
+      break;
     case 'S':
       vnet_tx_sync = 1;
       break;
@@ -123,7 +129,7 @@ static const struct argp argp =
 {
   options, parse_opt,
   "[--device=SLOT] [--selftest [--selftest-traffic]] [--status] "
-  "[--serve [--name=NAME]] [--sync] [--event-idx] [--verbose]",
+  "[--serve [--name=NAME]] [--sync] [--event-idx] [--no-event-idx] [--verbose]",
   "Virtio network driver: raw Ethernet I/O on QEMU's virtio-net PCI "
   "device (0x1af4:0x1000), with the Mach net-device semantics layer and "
   "a Mach device translator mode for Hurd network stacks (pfinet/lwip)"
